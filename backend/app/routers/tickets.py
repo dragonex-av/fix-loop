@@ -1,9 +1,9 @@
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 from typing import List, Optional
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from app.database import get_db
-from app.models import Ticket, Customer, Product, RepairRecord
+from app.models import Ticket, Customer, Product, RepairRecord, Technician, Appointment, Estimate, Invoice, TicketTimelineEvent
 from app.schemas import TicketCreate, TicketOut, AIAnalysisResponse
 from app.services.hindsight_service import hindsight_service
 from app.services.analysis_service import analysis_service
@@ -30,11 +30,14 @@ def get_tickets(
     status: Optional[str] = Query(None),
     model: Optional[str] = Query(None),
     category: Optional[str] = Query(None),
+    stage: Optional[str] = Query(None),
     db: Session = Depends(get_db)
 ):
     q = db.query(Ticket)
     if status:
         q = q.filter(Ticket.status == status)
+    if stage:
+        q = q.filter(Ticket.stage == stage)
     if category:
         q = q.filter(Ticket.issue_category == category)
     if model:
@@ -44,19 +47,23 @@ def get_tickets(
     results = []
     for t in tickets:
         latest_repair = t.repairs[-1] if t.repairs else None
+        tech = t.technician
         results.append({
             "id": t.id,
             "ticket_code": t.ticket_code or f"TCK-{t.id}",
             "customer_id": t.customer_id,
             "customer_name": t.customer.name if t.customer else "Unknown",
             "customer_phone": t.customer.phone if t.customer else "",
+            "customer_address": t.customer.address if t.customer else "",
             "product_id": t.product_id,
             "product_model": t.product.model if t.product else "Unknown",
             "product_type": t.product.product_type if t.product else "Unknown",
             "issue_description": t.issue_description,
             "issue_category": t.issue_category,
             "status": t.status,
+            "stage": t.stage,
             "priority": t.priority,
+            "technician_name": tech.name if tech else "Unassigned",
             "created_at": t.created_at,
             "updated_at": t.updated_at,
             "latest_action": latest_repair.action if latest_repair else None,
@@ -71,10 +78,9 @@ async def create_ticket(payload: TicketCreate, db: Session = Depends(get_db)):
     1. Looks up or creates customer
     2. Looks up or creates product
     3. Normalizes category
-    4. Saves ticket in SQLite
+    4. Saves ticket in DB
     5. Retains the initial complaint experience into Hindsight Cloud
     """
-    # 1. Customer
     customer = None
     if payload.customer_id:
         customer = db.query(Customer).filter(Customer.id == payload.customer_id).first()
@@ -84,12 +90,16 @@ async def create_ticket(payload: TicketCreate, db: Session = Depends(get_db)):
     if not customer:
         name = payload.customer_name or "New Customer"
         phone = payload.customer_phone or f"+1-555-{int(datetime.now().timestamp()) % 10000:04d}"
-        customer = Customer(name=name, phone=phone, email=payload.customer_email)
+        customer = Customer(
+            name=name,
+            phone=phone,
+            email=payload.customer_email,
+            address=payload.customer_address
+        )
         db.add(customer)
         db.commit()
         db.refresh(customer)
 
-    # 2. Product
     product = None
     if payload.product_id:
         product = db.query(Product).filter(Product.id == payload.product_id).first()
@@ -97,7 +107,7 @@ async def create_ticket(payload: TicketCreate, db: Session = Depends(get_db)):
     if not product:
         model = payload.model or "Model X"
         p_type = payload.product_type or "Washing Machine"
-        brand = payload.brand or "Apex"
+        brand = payload.brand or "Apex Appliances"
         product = (
             db.query(Product)
             .filter(
@@ -111,16 +121,15 @@ async def create_ticket(payload: TicketCreate, db: Session = Depends(get_db)):
                 customer_id=customer.id,
                 product_type=p_type,
                 brand=brand,
-                model=model
+                model=model,
+                serial_number=payload.serial_number or f"SN-{model[:2]}-{customer.id:04d}"
             )
             db.add(product)
             db.commit()
             db.refresh(product)
 
-    # 3. Normalized category
     category = payload.issue_category or normalize_category(payload.issue_description)
 
-    # Check for repeat complaint on same customer + model
     prior_tickets_count = (
         db.query(Ticket)
         .filter(
@@ -129,25 +138,43 @@ async def create_ticket(payload: TicketCreate, db: Session = Depends(get_db)):
         )
         .count()
     )
-    initial_status = "Reopened" if prior_tickets_count > 0 else "New"
+    is_repeat = prior_tickets_count > 0
+    initial_status = "Reopened" if is_repeat else "New"
+    initial_stage = "support_review" if is_repeat else "complaint_registered"
 
-    # 4. Save ticket
+    now = datetime.now(timezone.utc)
+    sla_hours = 24 if payload.priority == "High" else 48
+    sla = now + timedelta(hours=sla_hours)
+
     ticket = Ticket(
         customer_id=customer.id,
         product_id=product.id,
         issue_description=payload.issue_description,
         issue_category=category,
         status=initial_status,
-        priority=payload.priority or "Medium"
+        stage=initial_stage,
+        priority=payload.priority or "Medium",
+        image_url=payload.image_url,
+        is_reopened=is_repeat,
+        sla_deadline=sla
     )
     db.add(ticket)
+    db.flush()
+
+    ticket.ticket_code = f"TCK-{1000 + ticket.id}"
+    
+    ev = TicketTimelineEvent(
+        ticket_id=ticket.id,
+        stage=initial_stage,
+        title="Complaint Registered",
+        description=f"Ticket logged for {product.brand} {product.model}: '{payload.issue_description}'.",
+        performed_by="Staff Intake"
+    )
+    db.add(ev)
     db.commit()
     db.refresh(ticket)
 
-    ticket.ticket_code = f"TCK-{1000 + ticket.id}"
-    db.commit()
-
-    # 5. Hindsight Retain (Initial complaint)
+    # Hindsight Retain
     complaint_summary = (
         f"Customer {customer.name} (ID: {customer.id}) reported {category} on {product.brand} {product.model}: "
         f"'{payload.issue_description}' (Ticket: {ticket.ticket_code})"
@@ -161,7 +188,7 @@ async def create_ticket(payload: TicketCreate, db: Session = Depends(get_db)):
             "ticket_code": ticket.ticket_code,
             "product_model": product.model,
             "category": category,
-            "is_repeat": prior_tickets_count > 0
+            "is_repeat": is_repeat
         }
     )
 
@@ -175,9 +202,10 @@ async def create_ticket(payload: TicketCreate, db: Session = Depends(get_db)):
         "issue_description": ticket.issue_description,
         "issue_category": ticket.issue_category,
         "status": ticket.status,
+        "stage": ticket.stage,
         "priority": ticket.priority,
         "created_at": ticket.created_at,
-        "is_repeat": prior_tickets_count > 0,
+        "is_repeat": is_repeat,
         "hindsight_retain_status": retain_res.get("status")
     }
 
@@ -212,6 +240,12 @@ def get_ticket_detail(ticket_id: int, db: Session = Depends(get_db)):
         for f in ticket.followups
     ]
 
+    tech = ticket.technician
+    appointment = db.query(Appointment).filter(Appointment.ticket_id == ticket.id).order_by(Appointment.scheduled_at.desc()).first()
+    estimate = db.query(Estimate).filter(Estimate.ticket_id == ticket.id).order_by(Estimate.created_at.desc()).first()
+    invoice = db.query(Invoice).filter(Invoice.ticket_id == ticket.id).order_by(Invoice.created_at.desc()).first()
+    timeline = db.query(TicketTimelineEvent).filter(TicketTimelineEvent.ticket_id == ticket.id).order_by(TicketTimelineEvent.created_at.asc()).all()
+
     return {
         "id": ticket.id,
         "ticket_code": ticket.ticket_code or f"TCK-{ticket.id}",
@@ -219,7 +253,8 @@ def get_ticket_detail(ticket_id: int, db: Session = Depends(get_db)):
             "id": ticket.customer.id,
             "name": ticket.customer.name,
             "phone": ticket.customer.phone,
-            "email": ticket.customer.email
+            "email": ticket.customer.email,
+            "address": ticket.customer.address
         },
         "product": {
             "id": ticket.product.id,
@@ -228,14 +263,62 @@ def get_ticket_detail(ticket_id: int, db: Session = Depends(get_db)):
             "model": ticket.product.model,
             "serial_number": ticket.product.serial_number
         },
+        "technician": {
+            "id": tech.id,
+            "name": tech.name,
+            "phone": tech.phone,
+            "rating": tech.rating,
+            "specialization": tech.specialization
+        } if tech else None,
+        "appointment": {
+            "id": appointment.id,
+            "scheduled_at": appointment.scheduled_at,
+            "status": appointment.status,
+            "notes": appointment.notes
+        } if appointment else None,
+        "estimate": {
+            "id": estimate.id,
+            "parts_cost": estimate.parts_cost,
+            "labor_cost": estimate.labor_cost,
+            "tax": estimate.tax,
+            "total": estimate.total,
+            "items_breakdown": estimate.items_breakdown,
+            "description": estimate.description,
+            "status": estimate.status,
+            "rejection_reason": estimate.rejection_reason
+        } if estimate else None,
+        "invoice": {
+            "id": invoice.id,
+            "invoice_number": invoice.invoice_number,
+            "amount": invoice.amount,
+            "status": invoice.status,
+            "payment_method": invoice.payment_method,
+            "paid_at": invoice.paid_at
+        } if invoice else None,
         "issue_description": ticket.issue_description,
         "issue_category": ticket.issue_category,
         "status": ticket.status,
+        "stage": ticket.stage or "complaint_registered",
         "priority": ticket.priority,
+        "image_url": ticket.image_url,
+        "is_reopened": ticket.is_reopened,
+        "rating": ticket.rating,
+        "feedback": ticket.feedback,
         "created_at": ticket.created_at,
         "updated_at": ticket.updated_at,
         "repairs": repairs,
-        "followups": followups
+        "followups": followups,
+        "timeline": [
+            {
+                "id": ev.id,
+                "stage": ev.stage,
+                "title": ev.title,
+                "description": ev.description,
+                "performed_by": ev.performed_by,
+                "created_at": ev.created_at
+            }
+            for ev in timeline
+        ]
     }
 
 @router.post("/{ticket_id}/analyze", response_model=AIAnalysisResponse)

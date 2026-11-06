@@ -2,8 +2,15 @@ import os
 import json
 import logging
 import certifi
+from datetime import datetime, date
 from typing import Dict, Any, List, Optional
 from app.config import settings
+
+def _json_default(obj):
+    """Make datetime/date JSON-serializable."""
+    if isinstance(obj, (datetime, date)):
+        return obj.isoformat()
+    raise TypeError(f"Object of type {type(obj).__name__} is not JSON serializable")
 
 os.environ["SSL_CERT_FILE"] = certifi.where()
 
@@ -96,7 +103,7 @@ You MUST respond in valid JSON format matching this schema:
             chat_completion = await client.chat.completions.create(
                 messages=[
                     {"role": "system", "content": prompt_system},
-                    {"role": "user", "content": f"Analyze this support case with provided evidence:\n{json.dumps(context_payload, indent=2)}"}
+                    {"role": "user", "content": f"Analyze this support case with provided evidence:\n{json.dumps(context_payload, indent=2, default=_json_default)}"}
                 ],
                 model=self.model,
                 response_format={"type": "json_object"},
