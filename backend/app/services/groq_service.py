@@ -1,25 +1,35 @@
+import os
 import json
 import logging
-import httpx
+import certifi
 from typing import Dict, Any, List, Optional
 from app.config import settings
+
+os.environ["SSL_CERT_FILE"] = certifi.where()
 
 logger = logging.getLogger("fixloop.groq")
 
 class GroqService:
     """
     Groq LLM Reasoning Service.
-    Sends current complaint + recalled Hindsight memories + past repair outcomes.
-    Enforces evidence-grounding: LLM cannot fabricate past repairs.
-    Returns structured JSON with advisory next steps.
+    Powered by official groq SDK with fast structured JSON output.
     """
     def __init__(self):
         self.api_key = settings.GROQ_API_KEY
         self.model = settings.GROQ_MODEL
-        self.base_url = "https://api.groq.com/openai/v1/chat/completions"
+        self._client = None
 
     def is_configured(self) -> bool:
         return bool(self.api_key and self.api_key.strip())
+
+    def get_client(self):
+        if not self._client and self.is_configured():
+            try:
+                from groq import AsyncGroq
+                self._client = AsyncGroq(api_key=self.api_key)
+            except Exception as e:
+                logger.error(f"Failed to initialize Groq client: {e}")
+        return self._client
 
     async def analyze_repair(
         self,
@@ -34,9 +44,8 @@ class GroqService:
         """
         Synthesizes historical evidence and returns structured advisory repair insights.
         """
-        # If Groq key is not configured, return deterministic rule-based analysis grounded in real DB records
-        if not self.is_configured():
-            logger.info("Groq API key not provided; returning deterministic grounded fallback.")
+        client = self.get_client()
+        if not client:
             return self._fallback_grounded_analysis(
                 complaint_text, issue_category, product_model, customer_history, recalled_memories
             )
@@ -84,33 +93,20 @@ You MUST respond in valid JSON format matching this schema:
         }
 
         try:
-            async with httpx.AsyncClient(timeout=15.0) as client:
-                headers = {
-                    "Authorization": f"Bearer {self.api_key}",
-                    "Content-Type": "application/json"
-                }
-                body = {
-                    "model": self.model,
-                    "messages": [
-                        {"role": "system", "content": prompt_system},
-                        {"role": "user", "content": f"Analyze this support case with provided evidence:\n{json.dumps(context_payload, indent=2)}"}
-                    ],
-                    "response_format": {"type": "json_object"},
-                    "temperature": 0.1
-                }
-                response = await client.post(self.base_url, json=body, headers=headers)
-                if response.status_code == 200:
-                    data = response.json()
-                    content = data["choices"][0]["message"]["content"]
-                    parsed = json.loads(content)
-                    return parsed
-                else:
-                    logger.error(f"Groq API error {response.status_code}: {response.text}")
-                    return self._fallback_grounded_analysis(
-                        complaint_text, issue_category, product_model, customer_history, recalled_memories
-                    )
+            chat_completion = await client.chat.completions.create(
+                messages=[
+                    {"role": "system", "content": prompt_system},
+                    {"role": "user", "content": f"Analyze this support case with provided evidence:\n{json.dumps(context_payload, indent=2)}"}
+                ],
+                model=self.model,
+                response_format={"type": "json_object"},
+                temperature=0.1
+            )
+            content = chat_completion.choices[0].message.content
+            parsed = json.loads(content)
+            return parsed
         except Exception as e:
-            logger.error(f"Error calling Groq API: {e}")
+            logger.error(f"Error calling live Groq API: {e}")
             return self._fallback_grounded_analysis(
                 complaint_text, issue_category, product_model, customer_history, recalled_memories
             )
@@ -123,10 +119,6 @@ You MUST respond in valid JSON format matching this schema:
         customer_history: List[Dict[str, Any]],
         recalled_memories: List[Dict[str, Any]]
     ) -> Dict[str, Any]:
-        """
-        Deterministic, evidence-grounded fallback to guarantee 100% demo uptime
-        even without an active Groq API key or in case of network outages.
-        """
         prior_repairs = [t for t in customer_history if t.get("repairs")]
         has_prior = len(prior_repairs) > 0
         
