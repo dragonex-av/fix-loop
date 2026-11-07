@@ -1,22 +1,50 @@
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
+from sqlalchemy import func
+from typing import Optional
 from app.database import get_db
-from app.models import Ticket, Followup, PatternAlert, MemoryEvent, Technician, Product
+from app.models import Ticket, Followup, PatternAlert, MemoryEvent, Technician, Product, Customer
 from app.schemas import DashboardMetrics
 from app.services.pattern_service import pattern_service
 from app.services.followup_service import followup_service
+from app.services.auth_service import get_current_user
 
 router = APIRouter(prefix="/api/dashboard", tags=["dashboard"])
 
 @router.get("", response_model=DashboardMetrics)
-def get_dashboard_metrics(db: Session = Depends(get_db)):
+def get_dashboard_metrics(
+    status: Optional[str] = Query(None),
+    technician_id: Optional[int] = Query(None),
+    days: Optional[int] = Query(None),
+    db: Session = Depends(get_db)
+):
     # Refresh pattern and followup states
     pattern_service.scan_and_update_patterns(db)
     followup_service.refresh_statuses(db)
 
-    total_tickets = db.query(Ticket).count()
-    open_tickets = db.query(Ticket).filter(Ticket.status.in_(["New", "Open", "In Progress", "Reopened", "Investigate"])).count()
-    repeat_cases = db.query(Ticket).filter(Ticket.status == "Reopened").count()
+    # Base query for tickets
+    ticket_q = db.query(Ticket)
+    if status:
+        ticket_q = ticket_q.filter(Ticket.status == status.upper())
+    if technician_id:
+        ticket_q = ticket_q.filter(Ticket.technician_id == technician_id)
+    if days:
+        from datetime import datetime, timezone, timedelta
+        cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+        ticket_q = ticket_q.filter(Ticket.created_at >= cutoff)
+
+    total_tickets = ticket_q.count()
+
+    # Active/Open states in single status enum: OPEN, SCHEDULED, IN_PROGRESS, PENDING_VERIFICATION, RESCHEDULED
+    open_tickets = db.query(Ticket).filter(
+        Ticket.status.in_(["OPEN", "SCHEDULED", "IN_PROGRESS", "PENDING_VERIFICATION", "RESCHEDULED", "New", "Open", "In Progress", "Reopened"])
+    ).count()
+
+    # Repeat Cases: tickets marked as repeat OR reopened
+    repeat_cases = db.query(Ticket).filter(
+        (Ticket.is_repeat == True) | (Ticket.is_reopened == True)
+    ).count()
+
     overdue_followups = db.query(Followup).filter(Followup.status == "overdue").count()
     active_patterns = db.query(PatternAlert).filter(PatternAlert.status == "active").count()
 
@@ -29,16 +57,19 @@ def get_dashboard_metrics(db: Session = Depends(get_db)):
 
     # Technician Workload
     techs = db.query(Technician).all()
-    technician_workload = [
-        {
+    technician_workload = []
+    for t in techs:
+        active_count = db.query(Ticket).filter(
+            Ticket.technician_id == t.id,
+            Ticket.status.in_(["OPEN", "SCHEDULED", "IN_PROGRESS", "PENDING_VERIFICATION", "RESCHEDULED"])
+        ).count()
+        technician_workload.append({
             "id": t.id,
             "name": t.name,
             "specialization": t.specialization,
-            "active_tickets": t.active_tickets_count,
+            "active_tickets": active_count,
             "rating": t.rating
-        }
-        for t in techs
-    ]
+        })
 
     # Product Distribution
     prod_counts = (
@@ -66,11 +97,12 @@ def get_dashboard_metrics(db: Session = Depends(get_db)):
             "status": t.status,
             "stage": t.stage,
             "priority": t.priority,
+            "is_repeat": bool(t.is_repeat),
             "created_at": t.created_at,
             "latest_outcome": latest_repair.outcome if latest_repair else None
         })
 
-    # Recent memory events
+    # Recent memory events (deduplicated)
     mem_events_q = db.query(MemoryEvent).order_by(MemoryEvent.created_at.desc()).limit(6).all()
     recent_memories = [
         {
@@ -100,7 +132,7 @@ def get_dashboard_metrics(db: Session = Depends(get_db)):
     for p in patterns_q:
         needs_attention.append({
             "type": "ripple_pattern",
-            "title": f"Ripple Effect: {p.case_count} cases on {p.product_model}",
+            "title": f"Ripple Effect: {p.case_count} distinct customers on {p.product_model}",
             "severity": "critical",
             "detail": f"Cluster detected for '{p.issue_category}'. Recommended technical review.",
             "link_id": p.id

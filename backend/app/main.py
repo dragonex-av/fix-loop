@@ -2,7 +2,10 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from app.config import settings
 from app.database import engine, Base
-from app.routers import auth, portal, operations, customers, tickets, repairs, insights, followups, memory, dashboard
+from app.routers import (
+    auth, portal, operations, customers, tickets,
+    repairs, insights, followups, memory, dashboard, notifications
+)
 
 # Initialize tables
 Base.metadata.create_all(bind=engine)
@@ -33,6 +36,7 @@ app.include_router(repairs.router)
 app.include_router(insights.router)
 app.include_router(followups.router)
 app.include_router(memory.router)
+app.include_router(notifications.router)
 
 @app.get("/api/health")
 def health_check():
@@ -40,7 +44,7 @@ def health_check():
         "status": "healthy",
         "app": settings.APP_NAME,
         "version": settings.APP_VERSION,
-        "database": "NeonDB PostgreSQL",
+        "database": "FixLoop DB",
         "hindsight_configured": bool(settings.HINDSIGHT_API_KEY),
         "groq_configured": bool(settings.GROQ_API_KEY)
     }

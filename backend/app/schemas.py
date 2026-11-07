@@ -1,44 +1,50 @@
+from pydantic import BaseModel, EmailStr, Field
+from typing import Optional, List, Dict, Any
 from datetime import datetime
-from typing import Optional, List, Any
-from pydantic import BaseModel, Field, EmailStr
 
-# ----------------- Auth & User Schemas -----------------
-class UserRegister(BaseModel):
+# ----------------- Auth & Users -----------------
+class UserBase(BaseModel):
     email: EmailStr
-    password: str
     name: str
     phone: Optional[str] = None
     address: Optional[str] = None
-    role: Optional[str] = "customer"  # customer, executive, admin, technician
+
+class UserRegister(UserBase):
+    password: str
+    role: Optional[str] = "CUSTOMER"
 
 class UserLogin(BaseModel):
-    email: str
+    email: EmailStr
     password: str
+
+class GoogleLoginRequest(BaseModel):
+    id_token: str
+    target_role: Optional[str] = "CUSTOMER"  # Requested role: CUSTOMER or TECHNICIAN
+
+class UserOut(UserBase):
+    id: int
+    role: str
+    is_active: bool
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
 
 class TokenResponse(BaseModel):
     access_token: str
+    refresh_token: Optional[str] = None
     token_type: str = "bearer"
-    user: "UserOut"
-
-class UserOut(BaseModel):
-    id: int
-    email: str
-    name: str
-    role: str
-    phone: Optional[str] = None
-    address: Optional[str] = None
-    customer_id: Optional[int] = None
-    is_active: bool
-    created_at: datetime
-    class Config:
-        from_attributes = True
+    user: UserOut
 
 class UserProfileUpdate(BaseModel):
     name: Optional[str] = None
     phone: Optional[str] = None
     address: Optional[str] = None
 
-# ----------------- Customer Schemas -----------------
+class UserRoleUpdate(BaseModel):
+    role: str
+
+# ----------------- Customers -----------------
 class CustomerBase(BaseModel):
     name: str
     phone: str
@@ -51,19 +57,21 @@ class CustomerCreate(CustomerBase):
 class CustomerOut(CustomerBase):
     id: int
     created_at: datetime
+
     class Config:
         from_attributes = True
 
-# ----------------- Technician Schemas -----------------
+# ----------------- Technicians -----------------
 class TechnicianOut(BaseModel):
     id: int
+    user_id: Optional[int] = None
     name: str
     phone: str
     email: Optional[str] = None
     specialization: str
     rating: float
     active_tickets_count: int
-    created_at: datetime
+
     class Config:
         from_attributes = True
 
@@ -71,26 +79,22 @@ class TechnicianAssign(BaseModel):
     technician_id: int
     notes: Optional[str] = None
 
-# ----------------- Product Schemas -----------------
+# ----------------- Products -----------------
 class ProductBase(BaseModel):
     product_type: str
     brand: Optional[str] = "Apex Appliances"
     model: str
     serial_number: Optional[str] = None
 
-class ProductCreate(ProductBase):
-    customer_id: int
-
 class ProductOut(ProductBase):
     id: int
     customer_id: int
-    created_at: datetime
+
     class Config:
         from_attributes = True
 
-# ----------------- Appointment Schemas -----------------
+# ----------------- Appointments & Scheduling -----------------
 class AppointmentCreate(BaseModel):
-    ticket_id: int
     technician_id: int
     scheduled_at: datetime
     notes: Optional[str] = None
@@ -103,25 +107,46 @@ class AppointmentOut(BaseModel):
     id: int
     ticket_id: int
     technician_id: int
-    technician_name: Optional[str] = None
-    technician_phone: Optional[str] = None
     scheduled_at: datetime
     status: str
+    reschedule_reason: Optional[str] = None
     notes: Optional[str] = None
     created_at: datetime
+
     class Config:
         from_attributes = True
 
-# ----------------- Estimate Schemas -----------------
+# ----------------- OTP Verification -----------------
+class ResolutionVerifyRequest(BaseModel):
+    code: str
+
+class ResolutionRejectRequest(BaseModel):
+    reason: Optional[str] = "Customer reported issue is not resolved."
+
+# ----------------- Notifications -----------------
+class NotificationOut(BaseModel):
+    id: int
+    user_id: int
+    ticket_id: Optional[int] = None
+    type: str
+    title: str
+    body: str
+    is_read: bool
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+# ----------------- Estimates & Invoices -----------------
 class EstimateCreate(BaseModel):
-    parts_cost: float
-    labor_cost: float
+    parts_cost: float = 0.0
+    labor_cost: float = 0.0
     tax: float = 0.0
     items_breakdown: Optional[str] = None
     description: Optional[str] = None
 
 class EstimateReview(BaseModel):
-    status: str  # approved, rejected
+    approved: bool
     rejection_reason: Optional[str] = None
 
 class EstimateOut(BaseModel):
@@ -136,59 +161,64 @@ class EstimateOut(BaseModel):
     status: str
     rejection_reason: Optional[str] = None
     created_at: datetime
+
     class Config:
         from_attributes = True
 
-# ----------------- Invoice Schemas -----------------
 class InvoiceOut(BaseModel):
     id: int
     ticket_id: int
-    estimate_id: Optional[int] = None
     invoice_number: str
     amount: float
     status: str
     payment_method: str
     paid_at: Optional[datetime] = None
     created_at: datetime
+
     class Config:
         from_attributes = True
 
 class InvoicePay(BaseModel):
-    payment_method: str = "Credit/Debit Card (Simulated)"
+    payment_method: Optional[str] = "Card/UPI (Simulated)"
 
-# ----------------- Timeline Event Schemas -----------------
+# ----------------- Ticket Timeline & Chat -----------------
 class TimelineEventOut(BaseModel):
     id: int
-    ticket_id: int
     stage: str
     title: str
     description: Optional[str] = None
     performed_by: str
     created_at: datetime
+
     class Config:
         from_attributes = True
 
-# ----------------- Chat Message Schemas -----------------
+class TicketEventOut(BaseModel):
+    id: int
+    from_status: Optional[str] = None
+    to_status: str
+    actor_name: str
+    actor_role: str
+    note: Optional[str] = None
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
 class ChatMessageCreate(BaseModel):
     ticket_id: Optional[int] = None
     message: str
 
 class ChatMessageOut(BaseModel):
     id: int
-    customer_id: int
-    ticket_id: Optional[int] = None
     sender: str
     message: str
     created_at: datetime
+
     class Config:
         from_attributes = True
 
-# ----------------- Rating & Feedback -----------------
-class TicketRatingCreate(BaseModel):
-    rating: int = Field(..., ge=1, le=5)
-    feedback: Optional[str] = None
-
-# ----------------- Ticket Schemas -----------------
+# ----------------- Tickets -----------------
 class TicketCreate(BaseModel):
     customer_id: Optional[int] = None
     customer_name: Optional[str] = None
@@ -197,8 +227,8 @@ class TicketCreate(BaseModel):
     customer_address: Optional[str] = None
     
     product_id: Optional[int] = None
-    product_type: Optional[str] = "Washing Machine"
-    model: Optional[str] = "Model X"
+    product_type: str = "Washing Machine"
+    model: str = "Model X"
     brand: Optional[str] = "Apex Appliances"
     serial_number: Optional[str] = None
     
@@ -207,42 +237,50 @@ class TicketCreate(BaseModel):
     priority: Optional[str] = "Medium"
     image_url: Optional[str] = None
 
-class TicketStageUpdate(BaseModel):
-    stage: str
+class TicketRatingCreate(BaseModel):
+    rating: int = Field(..., ge=1, le=5)
+    feedback: Optional[str] = None
+
+class TicketStartWork(BaseModel):
+    action: Optional[str] = "Diagnostics started"
+    parts_used: Optional[str] = None
     notes: Optional[str] = None
+
+class TicketCancelRequest(BaseModel):
+    reason: str
 
 class TicketOut(BaseModel):
     id: int
     ticket_code: Optional[str] = None
     customer_id: int
+    customer_name: Optional[str] = None
+    customer_phone: Optional[str] = None
+    customer_address: Optional[str] = None
     product_id: int
-    technician_id: Optional[int] = None
+    product_model: Optional[str] = None
+    product_type: Optional[str] = None
     issue_description: str
     issue_category: str
     status: str
     stage: str
     priority: str
-    image_url: Optional[str] = None
-    sla_deadline: Optional[datetime] = None
-    estimated_cost: Optional[float] = None
-    final_cost: Optional[float] = None
+    technician_name: Optional[str] = "Unassigned"
+    is_repeat: bool = False
     is_reopened: bool = False
-    rating: Optional[int] = None
-    feedback: Optional[str] = None
     created_at: datetime
-    updated_at: datetime
-    customer: Optional[CustomerOut] = None
-    product: Optional[ProductOut] = None
-    technician: Optional[TechnicianOut] = None
+    updated_at: Optional[datetime] = None
+    latest_action: Optional[str] = None
+    latest_outcome: Optional[str] = None
+
     class Config:
         from_attributes = True
 
-# ----------------- Repair Schemas -----------------
+# ----------------- Repairs -----------------
 class RepairCreate(BaseModel):
     action: str
-    outcome: str = "pending"  # successful, temporary, unsuccessful, pending
+    outcome: str = "successful"  # successful, temporary, unsuccessful, pending
     technician_notes: Optional[str] = None
-    confirmed_by: Optional[str] = "Staff Lead"
+    confirmed_by: Optional[str] = None
 
 class RepairOut(BaseModel):
     id: int
@@ -253,83 +291,49 @@ class RepairOut(BaseModel):
     confirmed_by: Optional[str] = None
     confirmed_at: Optional[datetime] = None
     created_at: datetime
+
     class Config:
         from_attributes = True
 
-# ----------------- Followup Schemas -----------------
+# ----------------- Followups -----------------
 class FollowupCreate(BaseModel):
     ticket_id: int
     promised_at: datetime
-    owner: str = "Support Lead"
+    owner: str = "Support Team"
     notes: Optional[str] = None
 
 class FollowupUpdate(BaseModel):
     status: Optional[str] = None
     notes: Optional[str] = None
-    completed_at: Optional[datetime] = None
 
 class FollowupOut(BaseModel):
     id: int
-    customer_id: int
     ticket_id: int
+    customer_id: int
     promised_at: datetime
     owner: str
     status: str
     notes: Optional[str] = None
     completed_at: Optional[datetime] = None
     created_at: datetime
-    customer_name: Optional[str] = None
-    ticket_code: Optional[str] = None
+
     class Config:
         from_attributes = True
 
-# ----------------- AI Analysis / Repair Assistant -----------------
-class SupportingEvidenceItem(BaseModel):
-    source: str
-    reference: str
-    detail: Optional[str] = None
-
+# ----------------- AI & Dashboard -----------------
 class AIAnalysisResponse(BaseModel):
     ticket_id: int
     repeat_issue: bool
     repeat_reason: Optional[str] = None
     previous_repair_summary: Optional[str] = None
     previous_outcome: Optional[str] = None
-    suggested_inspection_areas: List[str] = []
+    suggested_inspection_areas: List[str]
     explanation: str
-    supporting_evidence: List[SupportingEvidenceItem] = []
-    limitations: List[str] = [
-        "This is an advisory suggestion based on recorded prior cases, not an automated physical diagnosis."
-    ]
+    supporting_evidence: List[Dict[str, Any]]
+    limitations: List[str]
     recalled_memories_count: int = 0
-    hindsight_status: str = "operational"
+    hindsight_status: str
 
-# ----------------- Ripple Effect / Pattern Schemas -----------------
-class SupportingTicketItem(BaseModel):
-    ticket_id: int
-    ticket_code: Optional[str] = None
-    customer_name: str
-    created_at: datetime
-    status: str
-    stage: Optional[str] = None
-    repair_action: Optional[str] = None
-    repair_outcome: Optional[str] = None
-
-class PatternAlertOut(BaseModel):
-    id: int
-    product_model: str
-    issue_category: str
-    case_count: int
-    window_start: Optional[datetime] = None
-    window_end: Optional[datetime] = None
-    status: str
-    staff_notes: Optional[str] = None
-    created_at: datetime
-    supporting_cases: List[SupportingTicketItem] = []
-    suggested_investigation: Optional[str] = None
-    disclaimer: str = "Potential operational pattern — requires technical inspection; not a confirmed defect."
-
-# ----------------- Memory Explorer Schemas -----------------
 class MemoryEventOut(BaseModel):
     id: int
     entity_type: str
@@ -338,23 +342,22 @@ class MemoryEventOut(BaseModel):
     query_or_content: str
     provider_ref: Optional[str] = None
     status: str
-    raw_response: Optional[str] = None
     error_summary: Optional[str] = None
     created_at: datetime
+
     class Config:
         from_attributes = True
 
-# ----------------- Dashboard Metric Schemas -----------------
 class DashboardMetrics(BaseModel):
     total_tickets: int
     open_tickets: int
     repeat_cases: int
     overdue_followups: int
     active_patterns: int
-    avg_resolution_hours: float = 24.5
-    customer_satisfaction: float = 4.8
-    recent_tickets: List[Any] = []
-    recent_memory_events: List[Any] = []
-    needs_attention: List[Any] = []
-    technician_workload: List[Any] = []
-    product_distribution: List[Any] = []
+    avg_resolution_hours: float
+    customer_satisfaction: float
+    recent_tickets: List[Dict[str, Any]]
+    recent_memory_events: List[Dict[str, Any]]
+    needs_attention: List[Dict[str, Any]]
+    technician_workload: List[Dict[str, Any]]
+    product_distribution: List[Dict[str, Any]]

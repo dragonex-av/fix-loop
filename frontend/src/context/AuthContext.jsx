@@ -1,14 +1,14 @@
 import React, { createContext, useContext, useState, useEffect } from 'react';
-import { login as apiLogin, getMe } from '../services/api';
+import { login as apiLogin, googleLogin as apiGoogleLogin, getMe } from '../services/api';
 
 const AuthContext = createContext(null);
 
 export const DEMO_PERSONAS = [
-  { label: 'Customer: Rahul Sharma', email: 'rahul@example.com', role: 'customer', name: 'Rahul Sharma', sub: 'Model X Washer Issue' },
-  { label: 'Customer: Priya Nair', email: 'priya@example.com', role: 'customer', name: 'Priya Nair', sub: 'Estimate Approval Pending' },
-  { label: 'Support Exec: Amit Sharma', email: 'support@fixloop.com', role: 'executive', name: 'Amit Sharma', sub: 'Operations Lead' },
-  { label: 'Admin: Sarah Jenkins', email: 'admin@fixloop.com', role: 'admin', name: 'Sarah Jenkins', sub: 'Central Operations Director' },
-  { label: 'Technician: Vikram Singh', email: 'tech.vikram@fixloop.com', role: 'technician', name: 'Vikram Singh', sub: 'Senior Field Specialist' },
+  { label: 'Customer: Rahul Sharma', email: 'rahul@example.com', role: 'CUSTOMER', name: 'Rahul Sharma', sub: 'Model X Washer (Repeat Case TCK-1010)' },
+  { label: 'Customer: Priya Nair', email: 'priya@example.com', role: 'CUSTOMER', name: 'Priya Nair', sub: 'TCK-1003 (Estimate Pending)' },
+  { label: 'Technician: Vikram Singh', email: 'tech.vikram@fixloop.com', role: 'TECHNICIAN', name: 'Vikram Singh', sub: 'Senior Field Specialist' },
+  { label: 'Admin: Sarah Jenkins', email: 'admin@fixloop.com', role: 'ADMIN', name: 'Sarah Jenkins', sub: 'Central Operations Director' },
+  { label: 'Admin: Amit Sharma', email: 'support@fixloop.com', role: 'ADMIN', name: 'Amit Sharma', sub: 'Operations Lead' },
 ];
 
 export function AuthProvider({ children }) {
@@ -25,11 +25,11 @@ export function AuthProvider({ children }) {
           setUser(res.data);
         } catch (e) {
           console.warn('Session expired, logging in default demo persona...');
-          await loginWithEmail('rahul@example.com', 'password123');
+          await loginWithEmail('admin@fixloop.com', 'password123');
         }
       } else {
-        // Default to Rahul Sharma for instant demo accessibility
-        await loginWithEmail('rahul@example.com', 'password123');
+        // Default to Admin Sarah Jenkins for instant dashboard demo
+        await loginWithEmail('admin@fixloop.com', 'password123');
       }
       setLoading(false);
     }
@@ -50,14 +50,31 @@ export function AuthProvider({ children }) {
     }
   };
 
+  const loginWithGoogle = async (idToken, targetRole = 'CUSTOMER') => {
+    try {
+      const res = await apiGoogleLogin({ id_token: idToken, target_role: targetRole });
+      const { access_token, user: userData } = res.data;
+      localStorage.setItem('fixloop_token', access_token);
+      setToken(access_token);
+      setUser(userData);
+      return userData;
+    } catch (err) {
+      console.error('Google login error:', err);
+      throw err;
+    }
+  };
+
   const logout = () => {
     localStorage.removeItem('fixloop_token');
     setToken(null);
     setUser(null);
   };
 
-  const isCustomer = user?.role === 'customer';
-  const isEmployee = ['admin', 'executive', 'technician'].includes(user?.role);
+  const role = user?.role ? user.role.toUpperCase() : '';
+  const isCustomer = role === 'CUSTOMER';
+  const isTechnician = role === 'TECHNICIAN';
+  const isAdmin = role === 'ADMIN';
+  const isEmployee = isTechnician || isAdmin;
 
   return (
     <AuthContext.Provider
@@ -65,9 +82,13 @@ export function AuthProvider({ children }) {
         user,
         token,
         loading,
+        role,
         isCustomer,
+        isTechnician,
+        isAdmin,
         isEmployee,
         loginWithEmail,
+        loginWithGoogle,
         logout,
         setUser
       }}

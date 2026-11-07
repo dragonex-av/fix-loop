@@ -1,22 +1,22 @@
-from datetime import datetime, timezone, timedelta
 from typing import List, Dict, Any
 from sqlalchemy.orm import Session
 from sqlalchemy import func
-from app.models import Ticket, Customer, Product, RepairRecord, PatternAlert, PatternAlertCase
+from app.models import Ticket, Product, PatternAlert, PatternAlertCase
+from app.config import settings
 
 class PatternService:
     """
     Business Intelligence: The Ripple Effect.
     Detects cross-customer failure clusters sharing the same product model + issue category.
-    Links the exact supporting tickets so judges can inspect the underlying evidence.
+    Counts DISTINCT customers (not raw tickets).
     """
-    DEMO_CLUSTER_THRESHOLD = 3  # Alert triggers when 3 or more distinct customers report the same issue on a model
-
     def scan_and_update_patterns(self, db: Session) -> List[PatternAlert]:
         """
         Scans all tickets in the system, groups by (product.model, ticket.issue_category)
-        across distinct customer_id, and creates/updates PatternAlerts.
+        across DISTINCT customer_id, and creates/updates PatternAlerts when threshold is met.
         """
+        threshold = settings.RIPPLE_THRESHOLD
+
         # Query distinct customer counts grouped by model and issue_category
         clusters = (
             db.query(
@@ -32,8 +32,7 @@ class PatternService:
 
         active_alerts = []
         for cluster in clusters:
-            if cluster.unique_customers >= self.DEMO_CLUSTER_THRESHOLD:
-                # Find or create pattern alert
+            if cluster.unique_customers >= threshold:
                 alert = (
                     db.query(PatternAlert)
                     .filter(
@@ -47,15 +46,15 @@ class PatternService:
                     alert = PatternAlert(
                         product_model=cluster.model,
                         issue_category=cluster.category,
-                        case_count=cluster.total_tickets,
+                        case_count=cluster.unique_customers,
                         status="active",
-                        staff_notes=f"Flagged automatically: {cluster.unique_customers} distinct customers reported '{cluster.category}' on {cluster.model}."
+                        staff_notes=f"Cluster detected: {cluster.unique_customers} distinct customers reported '{cluster.category}' on {cluster.model}."
                     )
                     db.add(alert)
                     db.flush()
+                else:
+                    alert.case_count = cluster.unique_customers
 
-                alert.case_count = cluster.total_tickets
-                
                 # Link supporting tickets
                 matching_tickets = (
                     db.query(Ticket)
@@ -67,7 +66,7 @@ class PatternService:
                     .all()
                 )
 
-                # Clear and re-populate link table for deterministic consistency
+                # Clear and re-populate link table
                 db.query(PatternAlertCase).filter(PatternAlertCase.alert_id == alert.id).delete()
                 for t in matching_tickets:
                     alert_case = PatternAlertCase(alert_id=alert.id, ticket_id=t.id)
@@ -84,35 +83,28 @@ class PatternService:
         
         results = []
         for a in alerts:
-            # Gather supporting cases
             cases = []
             for pac in a.cases:
                 t = pac.ticket
-                cust_name = t.customer.name if t.customer else "Unknown"
-                latest_repair = t.repairs[-1] if t.repairs else None
-                cases.append({
-                    "ticket_id": t.id,
-                    "ticket_code": t.ticket_code or f"TCK-{t.id}",
-                    "customer_name": cust_name,
-                    "created_at": t.created_at,
-                    "status": t.status,
-                    "repair_action": latest_repair.action if latest_repair else "No repair yet",
-                    "repair_outcome": latest_repair.outcome if latest_repair else "pending"
-                })
+                if t:
+                    cases.append({
+                        "id": t.id,
+                        "ticket_code": t.ticket_code or f"TCK-{t.id}",
+                        "customer_name": t.customer.name if t.customer else "Unknown",
+                        "customer_id": t.customer_id,
+                        "status": t.status,
+                        "description": t.issue_description,
+                        "created_at": t.created_at
+                    })
 
             results.append({
                 "id": a.id,
                 "product_model": a.product_model,
                 "issue_category": a.issue_category,
-                "case_count": a.case_count,
-                "window_start": a.window_start,
-                "window_end": a.window_end,
+                "case_count": a.case_count,  # distinct customer count
                 "status": a.status,
                 "staff_notes": a.staff_notes,
-                "created_at": a.created_at,
-                "supporting_cases": cases,
-                "suggested_investigation": f"Review supplier lot batches for {a.product_model} {a.issue_category.lower()} components (e.g. pump seal & firmware trigger).",
-                "disclaimer": "Potential operational pattern — requires technical inspection; not a confirmed defect."
+                "cases": cases
             })
         return results
 

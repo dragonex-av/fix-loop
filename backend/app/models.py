@@ -1,5 +1,7 @@
 from datetime import datetime, timezone
-from sqlalchemy import Column, Integer, String, Text, DateTime, ForeignKey, Float, Boolean
+from sqlalchemy import (
+    Column, Integer, String, Text, DateTime, ForeignKey, Float, Boolean, Index
+)
 from sqlalchemy.orm import relationship
 from app.database import Base
 
@@ -11,8 +13,9 @@ class User(Base):
 
     id = Column(Integer, primary_key=True, index=True, autoincrement=True)
     email = Column(String(120), unique=True, index=True, nullable=False)
-    hashed_password = Column(String(255), nullable=False)
-    role = Column(String(50), nullable=False, default="customer")  # admin, executive, technician, customer
+    hashed_password = Column(String(255), nullable=True)  # Nullable for OAuth-only accounts
+    google_id = Column(String(255), unique=True, index=True, nullable=True)
+    role = Column(String(50), nullable=False, default="CUSTOMER")  # ADMIN, TECHNICIAN, CUSTOMER
     name = Column(String(100), nullable=False)
     phone = Column(String(30), nullable=True)
     address = Column(Text, nullable=True)
@@ -22,6 +25,7 @@ class User(Base):
 
     customer = relationship("Customer", back_populates="user", uselist=False)
     technician_profile = relationship("Technician", back_populates="user", uselist=False)
+    notifications = relationship("Notification", back_populates="user", cascade="all, delete-orphan")
 
 
 class Customer(Base):
@@ -30,11 +34,11 @@ class Customer(Base):
     id = Column(Integer, primary_key=True, index=True, autoincrement=True)
     name = Column(String(100), nullable=False)
     phone = Column(String(30), unique=True, index=True, nullable=False)
-    email = Column(String(120), nullable=True)
+    email = Column(String(120), nullable=True, index=True)
     address = Column(Text, nullable=True)
     created_at = Column(DateTime, default=utc_now)
 
-    user = relationship("User", back_populates="customer")
+    user = relationship("User", back_populates="customer", uselist=False)
     products = relationship("Product", back_populates="customer", cascade="all, delete-orphan")
     tickets = relationship("Ticket", back_populates="customer", cascade="all, delete-orphan")
     followups = relationship("Followup", back_populates="customer", cascade="all, delete-orphan")
@@ -48,7 +52,7 @@ class Technician(Base):
     user_id = Column(Integer, ForeignKey("users.id"), nullable=True)
     name = Column(String(100), nullable=False)
     phone = Column(String(30), nullable=False)
-    email = Column(String(120), nullable=True)
+    email = Column(String(120), nullable=True, index=True)
     specialization = Column(String(100), default="General Appliance Repair")
     rating = Column(Float, default=4.8)
     active_tickets_count = Column(Integer, default=0)
@@ -84,12 +88,12 @@ class Ticket(Base):
     technician_id = Column(Integer, ForeignKey("technicians.id"), nullable=True)
     
     issue_description = Column(Text, nullable=False)
-    issue_category = Column(String(100), nullable=False, index=True)  # Drainage issue, etc.
-    status = Column(String(50), default="New", index=True)  # New, Open, In Progress, Resolved, Reopened, Investigate
+    issue_category = Column(String(100), nullable=False, index=True)  # Drainage issue, Cooling issue, etc.
     
-    # Granular Swiggy/Zomato style order tracking stage:
-    # complaint_registered -> support_review -> technician_assigned -> visit_scheduled ->
-    # diagnosis_completed -> estimate_approval -> repair_in_progress -> quality_check -> resolved
+    # State Machine Status: OPEN, SCHEDULED, IN_PROGRESS, PENDING_VERIFICATION, RESOLVED, RESCHEDULED, CANCELLED
+    status = Column(String(50), default="OPEN", index=True)
+    
+    # Granular timeline stage
     stage = Column(String(50), default="complaint_registered", index=True)
     
     priority = Column(String(30), default="Medium")  # Low, Medium, High, Critical
@@ -98,7 +102,17 @@ class Ticket(Base):
     sla_deadline = Column(DateTime, nullable=True)
     estimated_cost = Column(Float, nullable=True)
     final_cost = Column(Float, nullable=True)
+    is_repeat = Column(Boolean, default=False, index=True)
     is_reopened = Column(Boolean, default=False)
+    
+    # Resolution details
+    resolved_at = Column(DateTime, nullable=True)
+    resolved_by = Column(String(100), nullable=True)
+    
+    # Cancellation details
+    cancellation_reason = Column(Text, nullable=True)
+    cancelled_at = Column(DateTime, nullable=True)
+    cancelled_by = Column(String(100), nullable=True)
     
     rating = Column(Integer, nullable=True)  # 1 to 5 stars
     feedback = Column(Text, nullable=True)
@@ -113,10 +127,18 @@ class Ticket(Base):
     followups = relationship("Followup", back_populates="ticket", cascade="all, delete-orphan")
     alert_links = relationship("PatternAlertCase", back_populates="ticket")
     timeline_events = relationship("TicketTimelineEvent", back_populates="ticket", cascade="all, delete-orphan")
+    events = relationship("TicketEvent", back_populates="ticket", cascade="all, delete-orphan")
     appointments = relationship("Appointment", back_populates="ticket", cascade="all, delete-orphan")
     estimates = relationship("Estimate", back_populates="ticket", cascade="all, delete-orphan")
     invoices = relationship("Invoice", back_populates="ticket", cascade="all, delete-orphan")
     chat_messages = relationship("CustomerChatMessage", back_populates="ticket", cascade="all, delete-orphan")
+    verification_otps = relationship("ResolutionOTP", back_populates="ticket", cascade="all, delete-orphan")
+    notifications = relationship("Notification", back_populates="ticket", cascade="all, delete-orphan")
+
+    __table_args__ = (
+        Index("idx_ticket_customer_product", "customer_id", "product_id"),
+        Index("idx_ticket_status_created", "status", "created_at"),
+    )
 
 
 class TicketTimelineEvent(Base):
@@ -133,19 +155,80 @@ class TicketTimelineEvent(Base):
     ticket = relationship("Ticket", back_populates="timeline_events")
 
 
+class TicketEvent(Base):
+    """
+    Audit table: records every single state machine transition.
+    """
+    __tablename__ = "ticket_events"
+
+    id = Column(Integer, primary_key=True, index=True, autoincrement=True)
+    ticket_id = Column(Integer, ForeignKey("tickets.id"), nullable=False, index=True)
+    from_status = Column(String(50), nullable=True)
+    to_status = Column(String(50), nullable=False)
+    actor_id = Column(Integer, ForeignKey("users.id"), nullable=True)
+    actor_name = Column(String(100), nullable=False, default="System")
+    actor_role = Column(String(50), nullable=False, default="SYSTEM")
+    note = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=utc_now, index=True)
+
+    ticket = relationship("Ticket", back_populates="events")
+
+
 class Appointment(Base):
     __tablename__ = "appointments"
 
     id = Column(Integer, primary_key=True, index=True, autoincrement=True)
     ticket_id = Column(Integer, ForeignKey("tickets.id"), nullable=False)
     technician_id = Column(Integer, ForeignKey("technicians.id"), nullable=False)
-    scheduled_at = Column(DateTime, nullable=False)
+    scheduled_at = Column(DateTime, nullable=False, index=True)
     status = Column(String(50), default="scheduled")  # scheduled, rescheduled, completed, cancelled
+    reschedule_reason = Column(Text, nullable=True)
     notes = Column(Text, nullable=True)
     created_at = Column(DateTime, default=utc_now)
 
     ticket = relationship("Ticket", back_populates="appointments")
     technician = relationship("Technician", back_populates="appointments")
+
+    __table_args__ = (
+        Index("idx_technician_schedule", "technician_id", "scheduled_at", "status"),
+    )
+
+
+class ResolutionOTP(Base):
+    """
+    Two-step OTP Resolution: stores only SHA-256 hashed OTP.
+    """
+    __tablename__ = "resolution_otps"
+
+    id = Column(Integer, primary_key=True, index=True, autoincrement=True)
+    ticket_id = Column(Integer, ForeignKey("tickets.id"), nullable=False, index=True)
+    otp_hash = Column(String(64), nullable=False)  # SHA-256 hex string
+    expires_at = Column(DateTime, nullable=False)
+    attempts = Column(Integer, default=0)
+    max_attempts = Column(Integer, default=5)
+    used = Column(Boolean, default=False)
+    created_at = Column(DateTime, default=utc_now)
+
+    ticket = relationship("Ticket", back_populates="verification_otps")
+
+
+class Notification(Base):
+    """
+    In-app notification system.
+    """
+    __tablename__ = "notifications"
+
+    id = Column(Integer, primary_key=True, index=True, autoincrement=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    ticket_id = Column(Integer, ForeignKey("tickets.id"), nullable=True, index=True)
+    type = Column(String(50), nullable=False)  # TICKET_CREATED, TICKET_ASSIGNED, VISIT_SCHEDULED, etc.
+    title = Column(String(150), nullable=False)
+    body = Column(Text, nullable=False)
+    is_read = Column(Boolean, default=False, index=True)
+    created_at = Column(DateTime, default=utc_now, index=True)
+
+    user = relationship("User", back_populates="notifications")
+    ticket = relationship("Ticket", back_populates="notifications")
 
 
 class Estimate(Base):
@@ -157,7 +240,7 @@ class Estimate(Base):
     labor_cost = Column(Float, default=0.0)
     tax = Column(Float, default=0.0)
     total = Column(Float, default=0.0)
-    items_breakdown = Column(Text, nullable=True)  # JSON or comma-separated items
+    items_breakdown = Column(Text, nullable=True)
     description = Column(Text, nullable=True)
     status = Column(String(50), default="pending")  # pending, approved, rejected
     rejection_reason = Column(Text, nullable=True)
@@ -237,7 +320,7 @@ class PatternAlert(Base):
     case_count = Column(Integer, default=0)
     window_start = Column(DateTime, nullable=True)
     window_end = Column(DateTime, nullable=True)
-    status = Column(String(50), default="active")  # active, investigating, dismissed
+    status = Column(String(50), default="active")  # active, investigating, acknowledged, resolved, dismissed
     staff_notes = Column(Text, nullable=True)
     created_at = Column(DateTime, default=utc_now)
 

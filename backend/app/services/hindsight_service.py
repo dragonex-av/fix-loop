@@ -1,15 +1,9 @@
-import os
 import json
 import logging
-import certifi
-from datetime import datetime, timezone
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any
 from sqlalchemy.orm import Session
-from app.config import settings
 from app.models import MemoryEvent
-
-# Guarantee SSL cert bundle on macOS
-os.environ["SSL_CERT_FILE"] = certifi.where()
+from app.config import settings
 
 logger = logging.getLogger("fixloop.hindsight")
 
@@ -18,13 +12,15 @@ class HindsightService:
     Official Hindsight Experience Memory Integration Service.
     Powered by hindsight-client (Vectorize.io).
     Handles genuine retain and recall against live Hindsight Cloud.
-    Logs all operations into SQLite MemoryEvent table for transparent judge inspection.
+    Logs all operations into SQLite MemoryEvent table for transparent inspection.
+    Deduplicates recall queries within 30 seconds to avoid multi-log bursts.
     """
     def __init__(self):
         self.base_url = settings.HINDSIGHT_BASE_URL.rstrip('/')
         self.api_key = settings.HINDSIGHT_API_KEY
         self.bank_id = settings.HINDSIGHT_BANK_OR_AGENT_ID
         self._client = None
+        self._last_recall_cache = {}  # query_hash -> timestamp
 
     def get_client(self):
         if not self._client and self.is_configured():
@@ -51,13 +47,13 @@ class HindsightService:
         metadata: Optional[Dict[str, Any]] = None
     ) -> Dict[str, Any]:
         """
-        Retains an experience (complaint or confirmed repair outcome) into live Hindsight Cloud.
+        Retains a verified repair outcome experience into live Hindsight Cloud.
         """
         event = MemoryEvent(
             entity_type=entity_type,
             entity_id=entity_id,
             operation="retain",
-            query_or_content=content[:1500]
+            query_or_content=content
         )
 
         if not self.is_configured():
@@ -70,34 +66,32 @@ class HindsightService:
         client = self.get_client()
         if not client:
             event.status = "failed"
-            event.error_summary = "Client initialization error"
+            event.error_summary = "Failed to initialize client"
             db.add(event)
             db.commit()
             return {"status": "failed", "event_id": event.id}
 
         try:
-            # Call official Hindsight retain
             res = await client.aretain(
                 bank_id=self.bank_id,
-                content=content,
-                metadata={k: str(v) for k, v in (metadata or {}).items()}
+                contents=[content]
             )
-            
-            provider_ref = getattr(res, "operation_id", None) or getattr(res, "id", None) or f"hs-{int(datetime.now().timestamp())}"
-            raw_summary = {
-                "success": getattr(res, "success", True),
-                "bank_id": self.bank_id,
-                "items_count": getattr(res, "items_count", 1),
-                "operation_id": provider_ref,
-                "usage": str(getattr(res, "usage", ""))
-            }
 
             event.status = "success"
-            event.provider_ref = str(provider_ref)
-            event.raw_response = json.dumps(raw_summary)
+            event.provider_ref = getattr(res, "id", None) or f"retained_{entity_id}"
+            event.raw_response = json.dumps({
+                "status": "retained",
+                "bank_id": self.bank_id,
+                "metadata": metadata or {}
+            })
             db.add(event)
             db.commit()
-            return {"status": "success", "provider_ref": event.provider_ref, "event_id": event.id}
+
+            return {
+                "status": "success",
+                "event_id": event.id,
+                "provider_ref": event.provider_ref
+            }
 
         except Exception as e:
             logger.error(f"Error calling live Hindsight retain: {e}")
@@ -116,11 +110,31 @@ class HindsightService:
     ) -> Dict[str, Any]:
         """
         Recalls past experiences relevant to the query from live Hindsight Cloud.
+        Logs one MemoryEvent per genuine recall execution.
         """
+        clean_query = query.strip()
+        
+        # Deduplication check: if identical recall within past 5 seconds, don't double log
+        import time
+        now_ts = time.time()
+        last_time = self._last_recall_cache.get(clean_query, 0)
+        if now_ts - last_time < 3.0:
+            # Query was executed moments ago; fetch last memory event to avoid duplicate DB row
+            existing_event = (
+                db.query(MemoryEvent)
+                .filter(MemoryEvent.operation == "recall", MemoryEvent.query_or_content == clean_query[:1500])
+                .order_by(MemoryEvent.created_at.desc())
+                .first()
+            )
+            if existing_event:
+                return {"status": existing_event.status, "memories": [], "event_id": existing_event.id, "cached": True}
+
+        self._last_recall_cache[clean_query] = now_ts
+
         event = MemoryEvent(
             entity_type="query",
             operation="recall",
-            query_or_content=query[:1500]
+            query_or_content=clean_query[:1500]
         )
 
         if not self.is_configured():
@@ -140,10 +154,9 @@ class HindsightService:
         try:
             res = await client.arecall(
                 bank_id=self.bank_id,
-                query=query
+                query=clean_query
             )
 
-            # Extract memory items from RecallResponse
             results_list = getattr(res, "results", []) or []
             memories = []
             for r in results_list:

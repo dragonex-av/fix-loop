@@ -1,14 +1,16 @@
 from datetime import datetime, timezone, timedelta
-from app.database import SessionLocal, Base, engine
+from app.database import SessionLocal, Base, get_engine
 from app.models import (
     User, Customer, Product, Ticket, Technician, Appointment,
-    Estimate, Invoice, TicketTimelineEvent, RepairRecord, Followup, MemoryEvent
+    Estimate, Invoice, TicketTimelineEvent, RepairRecord, Followup,
+    MemoryEvent, TicketEvent, ResolutionOTP, Notification
 )
 from app.services.auth_service import hash_password
 from app.services.pattern_service import pattern_service
 
 def seed():
-    print("Initializing schema on NeonDB PostgreSQL...")
+    engine = get_engine()
+    print("Initializing clean schema...")
     Base.metadata.drop_all(bind=engine)
     Base.metadata.create_all(bind=engine)
 
@@ -19,12 +21,12 @@ def seed():
 
     pwd_hash = hash_password("password123")
 
-    # 1. Employee Accounts
+    # 1. Staff / Employee Accounts
     admin_user = User(
         email="admin@fixloop.com",
         hashed_password=pwd_hash,
         name="Sarah Jenkins",
-        role="admin",
+        role="ADMIN",
         phone="+91-99000-11223",
         address="FixLoop HQ, Central Operations, Bangalore"
     )
@@ -34,7 +36,7 @@ def seed():
         email="support@fixloop.com",
         hashed_password=pwd_hash,
         name="Amit Sharma",
-        role="executive",
+        role="ADMIN",
         phone="+91-99000-44556",
         address="FixLoop Regional Support Center, Bangalore"
     )
@@ -44,7 +46,7 @@ def seed():
         email="tech.vikram@fixloop.com",
         hashed_password=pwd_hash,
         name="Vikram Singh",
-        role="technician",
+        role="TECHNICIAN",
         phone="+91-98700-11111",
         address="Service Hub North, Bangalore"
     )
@@ -55,7 +57,7 @@ def seed():
         email="tech.rajesh@fixloop.com",
         hashed_password=pwd_hash,
         name="Rajesh Roy",
-        role="technician",
+        role="TECHNICIAN",
         phone="+91-98700-22222",
         address="Service Hub East, Bangalore"
     )
@@ -179,12 +181,11 @@ def seed():
         db.flush()
         cust_objs[c["name"]] = cust
 
-        # Create user account for customer
         u = User(
             email=c["email"],
             hashed_password=pwd_hash,
             name=c["name"],
-            role="customer",
+            role="CUSTOMER",
             phone=c["phone"],
             address=c["address"],
             customer_id=cust.id,
@@ -204,9 +205,9 @@ def seed():
         db.flush()
         prod_objs[c["name"]] = prod
 
-    # 4. Tickets with Lifecycle Tracking & Events
-    
-    # CASE 1: Rahul's Previous Resolved Ticket (Drain Pipe cleaning -> temporary outcome)
+    # 4. Canonical Benchmark Tickets (Exact 8 Tickets, clean, verified)
+
+    # TCK-1001: Rahul Sharma - Prior Ticket (Cleaned hose -> outcome: temporary)
     t1 = Ticket(
         ticket_code="TCK-1001",
         customer_id=cust_objs["Rahul Sharma"].id,
@@ -214,13 +215,17 @@ def seed():
         technician_id=tech1.id,
         issue_description="Washing machine stops halfway with E20 drainage error. Water pooling inside drum.",
         issue_category="Drainage issue",
-        status="Resolved",
+        status="RESOLVED",
         stage="resolved",
         priority="High",
         estimated_cost=85.00,
         final_cost=85.00,
+        is_repeat=False,
+        is_reopened=False,
         rating=4,
         feedback="Technician was polite and cleaned the hose, but problem returned after 5 days.",
+        resolved_at=now - timedelta(days=11),
+        resolved_by="Vikram Singh",
         created_at=now - timedelta(days=12),
         updated_at=now - timedelta(days=11)
     )
@@ -263,7 +268,6 @@ def seed():
     )
     db.add(inv1)
 
-    # Follow-up for Rahul (Overdue)
     f1 = Followup(
         customer_id=cust_objs["Rahul Sharma"].id,
         ticket_id=t1.id,
@@ -275,29 +279,6 @@ def seed():
     )
     db.add(f1)
 
-    # Timeline events for TCK-1001
-    events_t1 = [
-        ("complaint_registered", "Complaint Registered", "Customer reported error E20 and standing water in drum.", "Rahul Sharma", -12),
-        ("support_review", "Support Review Completed", "Verified warranty status and assigned senior technician.", "Sarah Jenkins", -12),
-        ("technician_assigned", "Technician Assigned: Vikram Singh", "Vikram assigned for washing machine diagnostics.", "Operations", -12),
-        ("visit_scheduled", "Service Visit Scheduled", "Appointment set for 10:30 AM next day.", "System", -12),
-        ("diagnosis_completed", "Diagnosis Completed", "Debris detected in discharge hose.", "Vikram Singh", -11),
-        ("estimate_approval", "Estimate Approved", "Customer approved $85.00 repair quote.", "Rahul Sharma", -11),
-        ("repair_in_progress", "Repair Completed", "Hose cleaned and sanitized.", "Vikram Singh", -11),
-        ("quality_check", "Quality Inspection Passed", "Cycle tested without error.", "Vikram Singh", -11),
-        ("resolved", "Service Ticket Resolved", "Invoice paid and ticket closed.", "System", -11)
-    ]
-    for st, title, desc, perf, days_ago in events_t1:
-        db.add(TicketTimelineEvent(
-            ticket_id=t1.id,
-            stage=st,
-            title=title,
-            description=desc,
-            performed_by=perf,
-            created_at=now + timedelta(days=days_ago)
-        ))
-
-    # Initial Hindsight retain memory log for Rahul
     mem1 = MemoryEvent(
         entity_type="repair",
         entity_id=r1.id,
@@ -310,7 +291,33 @@ def seed():
     )
     db.add(mem1)
 
-    # CASE 2: Priya - Estimate Approval Pending (Customer Portal Showpiece!)
+    # TCK-1002: Aman Verma - Visit Scheduled
+    t2 = Ticket(
+        ticket_code="TCK-1002",
+        customer_id=cust_objs["Aman Verma"].id,
+        product_id=prod_objs["Aman Verma"].id,
+        technician_id=tech1.id,
+        issue_description="Drum won't drain water after rinse cycle on Model X.",
+        issue_category="Drainage issue",
+        status="SCHEDULED",
+        stage="visit_scheduled",
+        priority="Medium",
+        is_repeat=False,
+        created_at=now - timedelta(days=3)
+    )
+    db.add(t2)
+    db.flush()
+
+    app2 = Appointment(
+        ticket_id=t2.id,
+        technician_id=tech1.id,
+        scheduled_at=now + timedelta(days=1, hours=2),
+        status="scheduled",
+        notes="Gate security code: 4920"
+    )
+    db.add(app2)
+
+    # TCK-1003: Priya Nair - Estimate Approval Pending
     t3 = Ticket(
         ticket_code="TCK-1003",
         customer_id=cust_objs["Priya Nair"].id,
@@ -318,10 +325,11 @@ def seed():
         technician_id=tech1.id,
         issue_description="Standing water in drum at end of wash cycle; buzzer beeps continuously with E20 code.",
         issue_category="Drainage issue",
-        status="In Progress",
+        status="IN_PROGRESS",
         stage="estimate_approval",
         priority="High",
         estimated_cost=125.00,
+        is_repeat=False,
         created_at=now - timedelta(days=2),
         updated_at=now - timedelta(hours=3)
     )
@@ -350,63 +358,22 @@ def seed():
     )
     db.add(app3)
 
-    events_t3 = [
-        ("complaint_registered", "Complaint Registered", "Water standing in drum at end of cycle.", "Priya Nair", -2),
-        ("support_review", "Support Review Completed", "AI recalled recurring Model X drainage patterns.", "Amit Sharma", -2),
-        ("technician_assigned", "Technician Assigned: Vikram Singh", "Dispatched for drain assembly inspection.", "Operations", -1),
-        ("visit_scheduled", "Visit Scheduled", "Scheduled for technician physical inspection.", "System", -1),
-        ("diagnosis_completed", "Diagnosis Completed", "Pump impeller shaft loose; requires replacement.", "Vikram Singh", 0),
-        ("estimate_approval", "Estimate Generated", "Estimate of $125.00 sent to Priya for approval.", "Vikram Singh", 0)
-    ]
-    for st, title, desc, perf, days_ago in events_t3:
-        db.add(TicketTimelineEvent(
-            ticket_id=t3.id,
-            stage=st,
-            title=title,
-            description=desc,
-            performed_by=perf,
-            created_at=now + timedelta(days=days_ago)
-        ))
-
-    # CASE 3: Aman - Visit Scheduled
-    t2 = Ticket(
-        ticket_code="TCK-1002",
-        customer_id=cust_objs["Aman Verma"].id,
-        product_id=prod_objs["Aman Verma"].id,
-        technician_id=tech1.id,
-        issue_description="Drum won't drain water after rinse cycle on Model X.",
-        issue_category="Drainage issue",
-        status="In Progress",
-        stage="visit_scheduled",
-        priority="Medium",
-        created_at=now - timedelta(days=3)
-    )
-    db.add(t2)
-    db.flush()
-
-    app2 = Appointment(
-        ticket_id=t2.id,
-        technician_id=tech1.id,
-        scheduled_at=now + timedelta(days=1, hours=2),
-        status="scheduled",
-        notes="Gate security code: 4920"
-    )
-    db.add(app2)
-
-    # Cases 4 - 8: Karan, Neha, Riya, Arjun, Meera
+    # TCK-1004: Karan Patel
     t4 = Ticket(
         ticket_code="TCK-1004",
         customer_id=cust_objs["Karan Patel"].id,
         product_id=prod_objs["Karan Patel"].id,
         issue_description="Model X showing drainage timeout error on delicate wash.",
         issue_category="Drainage issue",
-        status="Open",
+        status="OPEN",
         stage="support_review",
         priority="Medium",
+        is_repeat=False,
         created_at=now - timedelta(days=4)
     )
     db.add(t4)
 
+    # TCK-1005: Neha Gupta
     t5 = Ticket(
         ticket_code="TCK-1005",
         customer_id=cust_objs["Neha Gupta"].id,
@@ -414,39 +381,45 @@ def seed():
         technician_id=tech3.id,
         issue_description="Water stays in machine after wash. Loud humming noise from bottom right pump area.",
         issue_category="Drainage issue",
-        status="In Progress",
+        status="IN_PROGRESS",
         stage="repair_in_progress",
         priority="High",
+        is_repeat=False,
         created_at=now - timedelta(days=3)
     )
     db.add(t5)
 
+    # TCK-1006: Riya Sen
     t6 = Ticket(
         ticket_code="TCK-1006",
         customer_id=cust_objs["Riya Sen"].id,
         product_id=prod_objs["Riya Sen"].id,
         issue_description="Drain cycle fails intermittently; water left behind in tub.",
         issue_category="Drainage issue",
-        status="Open",
+        status="OPEN",
         stage="complaint_registered",
         priority="Medium",
+        is_repeat=False,
         created_at=now - timedelta(days=2)
     )
     db.add(t6)
 
+    # TCK-1007: Arjun Mehta
     t7 = Ticket(
         ticket_code="TCK-1007",
         customer_id=cust_objs["Arjun Mehta"].id,
         product_id=prod_objs["Arjun Mehta"].id,
         issue_description="Model X washer drum full of soapy water, won't pump out.",
         issue_category="Drainage issue",
-        status="New",
+        status="OPEN",
         stage="complaint_registered",
         priority="High",
+        is_repeat=False,
         created_at=now - timedelta(hours=6)
     )
     db.add(t7)
 
+    # TCK-1008: Meera Joshi - Refrigerator
     t8 = Ticket(
         ticket_code="TCK-1008",
         customer_id=cust_objs["Meera Joshi"].id,
@@ -454,19 +427,60 @@ def seed():
         technician_id=tech2.id,
         issue_description="Refrigerator fresh food compartment warm; freezer is working fine.",
         issue_category="Cooling issue",
-        status="In Progress",
+        status="IN_PROGRESS",
         stage="diagnosis_completed",
         priority="Medium",
+        is_repeat=False,
         created_at=now - timedelta(hours=14)
     )
     db.add(t8)
+    db.flush()
+
+    # TCK-1010: Rahul Sharma - Repeat Case (E20 returned after 5 days, outcome: temporary)
+    t10 = Ticket(
+        ticket_code="TCK-1010",
+        customer_id=cust_objs["Rahul Sharma"].id,
+        product_id=prod_objs["Rahul Sharma"].id,
+        technician_id=tech1.id,
+        issue_description="E20 drainage error has returned on Model X washing machine. Drum is full of water again after rinse.",
+        issue_category="Drainage issue",
+        status="OPEN",
+        stage="support_review",
+        priority="High",
+        is_repeat=True,
+        is_reopened=True,
+        created_at=now - timedelta(hours=2)
+    )
+    db.add(t10)
+    db.flush()
+
+    # Audit event for repeat case
+    ev10 = TicketEvent(
+        ticket_id=t10.id,
+        from_status=None,
+        to_status="OPEN",
+        actor_name="Rahul Sharma",
+        actor_role="CUSTOMER",
+        note="Repeat case: E20 error recurred within 12 days following temporary drain pipe cleaning."
+    )
+    db.add(ev10)
+
+    # Add initial notification for Rahul
+    n1 = Notification(
+        user_id=cust_objs["Rahul Sharma"].user.id,
+        ticket_id=t10.id,
+        type="TICKET_CREATED",
+        title="Repeat Complaint Registered",
+        body="Your ticket TCK-1010 has been flagged as a repeat issue and escalated to engineering lead."
+    )
+    db.add(n1)
 
     db.commit()
 
     # Recalculate Ripple Effect
     patterns = pattern_service.scan_and_update_patterns(db)
-    print(f"Generated {len(patterns)} Ripple Effect pattern alert(s) across {len(demo_customers_data)} customers.")
-    print("Database seeding completed successfully on NeonDB!")
+    print(f"Generated {len(patterns)} Ripple Effect pattern alert(s) across distinct customers.")
+    print("Database seeding completed cleanly!")
     db.close()
 
 if __name__ == "__main__":

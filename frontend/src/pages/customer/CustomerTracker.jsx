@@ -1,8 +1,8 @@
 import React, { useEffect, useState } from 'react';
-import { getMyTickets, getMyTicket, reviewEstimate, payInvoice, rateService } from '../../services/api';
+import { getMyTickets, getMyTicket, reviewEstimate, payInvoice, rateService, rescheduleAppt, cancelTicket } from '../../services/api';
 import {
   CheckCircle2, Circle, Clock, Calendar, Star, ThumbsUp,
-  ThumbsDown, CreditCard, ChevronDown, Loader2, AlertCircle
+  ThumbsDown, CreditCard, ChevronDown, Loader2, AlertCircle, Key, XCircle
 } from 'lucide-react';
 
 const ALL_STAGES = [
@@ -13,7 +13,7 @@ const ALL_STAGES = [
   { key: 'diagnosis_completed',   label: 'Diagnosis Completed',    desc: 'Issue has been identified.' },
   { key: 'estimate_approval',     label: 'Estimate Approval',      desc: 'Waiting for your approval.' },
   { key: 'repair_in_progress',    label: 'Repair In Progress',     desc: 'Your device is being repaired.' },
-  { key: 'quality_check',         label: 'Quality Check',          desc: 'Final inspection underway.' },
+  { key: 'quality_check',         label: 'Verification OTP',       desc: 'Provide your verification code to the technician.' },
   { key: 'resolved',              label: 'Resolved ✓',             desc: 'Service completed successfully!' },
 ];
 
@@ -78,7 +78,7 @@ function StarRating({ value, onChange }) {
 }
 
 export default function CustomerTracker({ selectedTicketId, onSelectTicket }) {
-  const [allTickets, setAllTickets]   = useState([]);  // flat list for dropdown
+  const [allTickets, setAllTickets]   = useState([]);
   const [ticket, setTicket]           = useState(null);
   const [listLoading, setListLoading] = useState(true);
   const [ticketLoading, setTicketLoading] = useState(false);
@@ -87,9 +87,16 @@ export default function CustomerTracker({ selectedTicketId, onSelectTicket }) {
   const [feedback, setFeedback]       = useState('');
   const [submitting, setSubmitting]   = useState(false);
 
+  // Reschedule & Cancel state
+  const [showReschedule, setShowReschedule] = useState(false);
+  const [rescheduleDate, setRescheduleDate] = useState('');
+  const [rescheduleReason, setRescheduleReason] = useState('');
+  const [showCancel, setShowCancel] = useState(false);
+  const [cancelReason, setCancelReason] = useState('');
+
   const showToast = (msg) => { setToast(msg); setTimeout(() => setToast(''), 3500); };
 
-  // Load ticket list for dropdown
+  // Load ticket list
   useEffect(() => {
     getMyTickets().then((r) => {
       const data = r.data || {};
@@ -99,7 +106,7 @@ export default function CustomerTracker({ selectedTicketId, onSelectTicket }) {
     }).catch(console.error).finally(() => setListLoading(false));
   }, []);
 
-  // Load ticket detail whenever selection changes
+  // Load ticket detail
   useEffect(() => {
     if (!selectedTicketId) return;
     setTicketLoading(true);
@@ -141,10 +148,36 @@ export default function CustomerTracker({ selectedTicketId, onSelectTicket }) {
     finally { setSubmitting(false); }
   };
 
+  const handleReschedule = async (e) => {
+    e.preventDefault();
+    if (!rescheduleDate) return;
+    try {
+      setSubmitting(true);
+      await rescheduleAppt(ticket.id, { scheduled_at: new Date(rescheduleDate).toISOString(), reason: rescheduleReason });
+      showToast('✓ Appointment reschedule requested.');
+      setShowReschedule(false);
+      const r = await getMyTicket(ticket.id); setTicket(r.data);
+    } catch (e) { showToast('Error: ' + (e?.response?.data?.detail || 'Please try again.')); }
+    finally { setSubmitting(false); }
+  };
+
+  const handleCancelTicket = async (e) => {
+    e.preventDefault();
+    if (!cancelReason) return;
+    try {
+      setSubmitting(true);
+      await cancelTicket(ticket.id, cancelReason);
+      showToast('✓ Ticket cancelled.');
+      setShowCancel(false);
+      const r = await getMyTicket(ticket.id); setTicket(r.data);
+    } catch (e) { showToast('Error: ' + (e?.response?.data?.detail || 'Please try again.')); }
+    finally { setSubmitting(false); }
+  };
+
   if (listLoading) {
     return (
       <div className="flex items-center justify-center h-64 text-slate-400 text-sm gap-2">
-        <Loader2 className="w-5 h-5 animate-spin text-teal-500" /> Loading repairs...
+        <Loader2 className="w-5 h-5 animate-spin text-teal-500" /> Loading tickets...
       </div>
     );
   }
@@ -159,7 +192,6 @@ export default function CustomerTracker({ selectedTicketId, onSelectTicket }) {
     );
   }
 
-  // Helpers to get ticket detail fields regardless of nested/flat shape
   const productType  = ticket?.product?.type   || ticket?.product_type  || 'Appliance';
   const productModel = ticket?.product?.model  || ticket?.product_model || '';
   const productBrand = ticket?.product?.brand  || ticket?.brand         || '';
@@ -188,7 +220,7 @@ export default function CustomerTracker({ selectedTicketId, onSelectTicket }) {
           >
             {allTickets.map((t) => (
               <option key={t.id} value={t.id}>
-                {t.ticket_code} — {t.product_type} {t.product_model}
+                {t.ticket_code} — {t.product_type} {t.product_model} ({t.status})
               </option>
             ))}
           </select>
@@ -205,7 +237,7 @@ export default function CustomerTracker({ selectedTicketId, onSelectTicket }) {
           {/* Step Tracker */}
           <div className="md:col-span-2 bg-white rounded-2xl border border-slate-200 p-6 self-start">
             <h3 className="font-bold text-slate-800 mb-5 flex items-center gap-2">
-              <Clock className="w-4 h-4 text-teal-500" /> Repair Progress
+              <Clock className="w-4 h-4 text-teal-500" /> Repair Timeline
             </h3>
             <StepTracker currentStage={ticket.stage} />
           </div>
@@ -216,16 +248,25 @@ export default function CustomerTracker({ selectedTicketId, onSelectTicket }) {
             <div className="bg-white rounded-2xl border border-slate-200 p-6">
               <div className="flex items-start justify-between gap-3 mb-4">
                 <div>
-                  <span className="text-xs font-mono font-bold text-teal-600">{ticket.ticket_code}</span>
+                  <div className="flex items-center gap-2">
+                    <span className="text-xs font-mono font-bold text-teal-600">{ticket.ticket_code}</span>
+                    {ticket.is_repeat && (
+                      <span className="text-[10px] font-bold bg-amber-100 text-amber-700 px-2 py-0.5 rounded-full border border-amber-200">
+                        Repeat Case
+                      </span>
+                    )}
+                  </div>
                   <h2 className="text-lg font-bold text-slate-800 mt-0.5">{productType} — {productModel}</h2>
                   {productBrand && <p className="text-xs text-slate-400">{productBrand}</p>}
                 </div>
-                <span className={`text-xs font-bold px-2.5 py-1.5 rounded-full whitespace-nowrap ${
-                  ticket.stage === 'resolved'           ? 'bg-green-100 text-green-700' :
-                  ticket.stage === 'estimate_approval'  ? 'bg-orange-100 text-orange-700' :
-                  'bg-teal-100 text-teal-700'
+                <span className={`text-xs font-bold px-3 py-1.5 rounded-full whitespace-nowrap ${
+                  ticket.status === 'RESOLVED'             ? 'bg-green-100 text-green-700' :
+                  ticket.status === 'PENDING_VERIFICATION' ? 'bg-purple-100 text-purple-700' :
+                  ticket.status === 'IN_PROGRESS'          ? 'bg-teal-100 text-teal-700' :
+                  ticket.status === 'CANCELLED'            ? 'bg-slate-200 text-slate-600' :
+                  'bg-blue-100 text-blue-700'
                 }`}>
-                  {ticket.stage?.replace(/_/g, ' ').replace(/\b\w/g, l => l.toUpperCase())}
+                  {ticket.status}
                 </span>
               </div>
 
@@ -233,6 +274,7 @@ export default function CustomerTracker({ selectedTicketId, onSelectTicket }) {
                 {ticket.issue_description}
               </p>
 
+              {/* Technician Info */}
               {techName && (
                 <div className="mt-4 flex items-center gap-3 p-3 bg-blue-50 rounded-xl border border-blue-100">
                   <div className="w-9 h-9 bg-blue-200 rounded-full flex items-center justify-center font-bold text-blue-700 text-sm flex-shrink-0">
@@ -240,20 +282,104 @@ export default function CustomerTracker({ selectedTicketId, onSelectTicket }) {
                   </div>
                   <div>
                     <p className="text-xs font-semibold text-blue-800">{techName}</p>
-                    <p className="text-[11px] text-blue-500">{ticket.technician?.specialization || 'Field Technician'}</p>
+                    <p className="text-[11px] text-blue-500">{ticket.technician?.specialization || 'Assigned Technician'}</p>
                   </div>
                 </div>
               )}
 
+              {/* Appointment Card */}
               {apptDate && (
-                <div className="mt-3 flex items-center gap-2 text-sm text-slate-600 bg-indigo-50 rounded-xl p-3 border border-indigo-100">
-                  <Calendar className="w-4 h-4 text-indigo-500 flex-shrink-0" />
-                  <span>Appointment: <strong>
-                    {new Date(apptDate).toLocaleDateString('en-IN', { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' })}
-                  </strong></span>
+                <div className="mt-3 flex items-center justify-between text-sm text-slate-600 bg-indigo-50 rounded-xl p-3 border border-indigo-100">
+                  <div className="flex items-center gap-2">
+                    <Calendar className="w-4 h-4 text-indigo-500 flex-shrink-0" />
+                    <span>Appointment: <strong>
+                      {new Date(apptDate).toLocaleDateString('en-IN', { weekday: 'short', day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' })}
+                    </strong></span>
+                  </div>
+                  {['SCHEDULED', 'RESCHEDULED'].includes(ticket.status) && (
+                    <button
+                      onClick={() => setShowReschedule(!showReschedule)}
+                      className="text-xs font-semibold text-indigo-600 hover:text-indigo-800 underline"
+                    >
+                      Reschedule
+                    </button>
+                  )}
                 </div>
               )}
+
+              {/* Reschedule form */}
+              {showReschedule && (
+                <form onSubmit={handleReschedule} className="mt-3 p-3 bg-slate-100 rounded-xl space-y-2 text-xs">
+                  <p className="font-bold text-slate-700">Request New Appointment Slot</p>
+                  <input
+                    type="datetime-local"
+                    value={rescheduleDate}
+                    onChange={(e) => setRescheduleDate(e.target.value)}
+                    required
+                    className="w-full bg-white border border-slate-300 rounded-lg p-2"
+                  />
+                  <input
+                    type="text"
+                    value={rescheduleReason}
+                    onChange={(e) => setRescheduleReason(e.target.value)}
+                    placeholder="Reason for reschedule..."
+                    className="w-full bg-white border border-slate-300 rounded-lg p-2"
+                  />
+                  <div className="flex gap-2">
+                    <button type="submit" disabled={submitting} className="px-3 py-1.5 bg-indigo-600 text-white rounded-lg font-bold">Submit</button>
+                    <button type="button" onClick={() => setShowReschedule(false)} className="px-3 py-1.5 bg-slate-300 text-slate-700 rounded-lg">Cancel</button>
+                  </div>
+                </form>
+              )}
+
+              {/* Cancel Button */}
+              {['OPEN', 'SCHEDULED'].includes(ticket.status) && (
+                <div className="mt-3 flex justify-end">
+                  <button
+                    onClick={() => setShowCancel(!showCancel)}
+                    className="text-xs text-rose-500 hover:text-rose-700 flex items-center gap-1 font-medium"
+                  >
+                    <XCircle className="w-3.5 h-3.5" /> Cancel Request
+                  </button>
+                </div>
+              )}
+              {showCancel && (
+                <form onSubmit={handleCancelTicket} className="mt-2 p-3 bg-rose-50 border border-rose-200 rounded-xl text-xs space-y-2">
+                  <p className="font-bold text-rose-800">Cancel Service Request</p>
+                  <input
+                    type="text"
+                    value={cancelReason}
+                    onChange={(e) => setCancelReason(e.target.value)}
+                    placeholder="Reason for cancellation..."
+                    required
+                    className="w-full bg-white border border-rose-300 rounded-lg p-2 text-slate-800"
+                  />
+                  <div className="flex gap-2">
+                    <button type="submit" disabled={submitting} className="px-3 py-1.5 bg-rose-600 text-white rounded-lg font-bold">Confirm Cancel</button>
+                    <button type="button" onClick={() => setShowCancel(false)} className="px-3 py-1.5 bg-slate-200 text-slate-700 rounded-lg">Keep Ticket</button>
+                  </div>
+                </form>
+              )}
             </div>
+
+            {/* FEATURE 3: Two-Step OTP Resolution Banner (Customer View) */}
+            {ticket.status === 'PENDING_VERIFICATION' && (
+              <div className="bg-gradient-to-r from-purple-900 to-slate-900 text-white rounded-2xl p-6 shadow-xl border border-purple-500/40">
+                <div className="flex items-center gap-3 mb-2">
+                  <Key className="w-5 h-5 text-purple-300" />
+                  <h4 className="font-bold text-sm">Resolution Verification Code</h4>
+                </div>
+                <p className="text-xs text-purple-200 mb-4 leading-relaxed">
+                  The technician has completed physical repairs. If you are satisfied with the service, read this 6-digit code to the technician to confirm resolution:
+                </p>
+                <div className="bg-white/10 backdrop-blur rounded-xl p-4 text-center border border-white/20 mb-3">
+                  <span className="font-mono text-3xl font-black tracking-widest text-teal-300">
+                    {ticket.customer_otp || '••••••'}
+                  </span>
+                  <p className="text-[10px] text-purple-200 mt-1">Single-use secure code • Expires in 10 minutes</p>
+                </div>
+              </div>
+            )}
 
             {/* Estimate Approval */}
             {ticket.stage === 'estimate_approval' && est && (
@@ -265,13 +391,13 @@ export default function CustomerTracker({ selectedTicketId, onSelectTicket }) {
                 <div className="bg-white rounded-xl p-4 mb-4 border border-orange-100">
                   <p className="text-sm text-slate-600 mb-3">{est.description || est.diagnosis}</p>
                   <div className="grid grid-cols-3 gap-2 text-sm text-slate-500 mb-3">
-                    {est.parts_cost != null && <div>Parts: <strong className="text-slate-800">₹{est.parts_cost}</strong></div>}
-                    {est.labor_cost != null && <div>Labour: <strong className="text-slate-800">₹{est.labor_cost}</strong></div>}
-                    {est.tax != null && <div>Tax: <strong className="text-slate-800">₹{est.tax}</strong></div>}
+                    {est.parts_cost != null && <div>Parts: <strong className="text-slate-800">${est.parts_cost}</strong></div>}
+                    {est.labor_cost != null && <div>Labor: <strong className="text-slate-800">${est.labor_cost}</strong></div>}
+                    {est.tax != null && <div>Tax: <strong className="text-slate-800">${est.tax}</strong></div>}
                   </div>
                   <div className="flex items-center justify-between pt-2 border-t border-slate-100">
                     <span className="text-sm text-slate-500">Total Estimate</span>
-                    <span className="text-xl font-bold text-slate-900">₹{est.total?.toFixed(2) || est.amount?.toFixed(2)}</span>
+                    <span className="text-xl font-bold text-slate-900">${est.total?.toFixed(2)}</span>
                   </div>
                 </div>
                 <div className="flex gap-3">
@@ -296,7 +422,7 @@ export default function CustomerTracker({ selectedTicketId, onSelectTicket }) {
                 <div className="flex items-center justify-between mb-4 bg-slate-50 rounded-xl p-4">
                   <div>
                     <p className="text-xs text-slate-500">Invoice #{inv.invoice_number || inv.id}</p>
-                    <p className="text-xl font-bold text-slate-900 mt-1">₹{(inv.amount || inv.total_amount)?.toFixed(2)}</p>
+                    <p className="text-xl font-bold text-slate-900 mt-1">${inv.amount?.toFixed(2)}</p>
                   </div>
                   <span className="text-xs font-bold bg-amber-100 text-amber-700 px-2 py-1 rounded-full">Unpaid</span>
                 </div>
@@ -309,7 +435,7 @@ export default function CustomerTracker({ selectedTicketId, onSelectTicket }) {
             )}
 
             {/* Rate Service */}
-            {ticket.stage === 'resolved' && !ticket.rating && (
+            {ticket.status === 'RESOLVED' && !ticket.rating && (
               <div className="bg-white border border-slate-200 rounded-2xl p-5">
                 <h4 className="font-bold text-slate-800 mb-3 flex items-center gap-2">
                   <Star className="w-4 h-4 text-amber-500" /> Rate Your Experience
@@ -329,7 +455,7 @@ export default function CustomerTracker({ selectedTicketId, onSelectTicket }) {
               <div className="bg-green-50 border border-green-200 rounded-2xl p-4 flex items-center gap-3">
                 <CheckCircle2 className="w-5 h-5 text-green-500" />
                 <div>
-                  <p className="text-sm font-semibold text-green-800">Thank you for your feedback!</p>
+                  <p className="text-sm font-semibold text-green-800">Thank you for rating!</p>
                   <div className="flex items-center gap-1 mt-1">
                     {Array.from({ length: 5 }).map((_, i) => (
                       <Star key={i} className={`w-4 h-4 ${i < ticket.rating ? 'text-amber-400 fill-amber-400' : 'text-slate-300'}`} />

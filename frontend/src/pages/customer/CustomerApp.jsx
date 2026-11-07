@@ -5,14 +5,15 @@ import CustomerTracker from './CustomerTracker';
 import CustomerRaiseComplaint from './CustomerRaiseComplaint';
 import CustomerProfile from './CustomerProfile';
 import CustomerChatWidget from './CustomerChatWidget';
+import NotificationBell from '../../components/NotificationBell';
 import {
-  Home, List, PlusCircle, User, LogOut, MessageSquare, X, ChevronDown
+  Home, List, PlusCircle, User, LogOut, MessageSquare, ChevronDown
 } from 'lucide-react';
 
 const NAV = [
   { id: 'home',     label: 'Home',          icon: Home },
-  { id: 'tracker',  label: 'My Repairs',    icon: List },
-  { id: 'raise',    label: 'Raise Complaint', icon: PlusCircle },
+  { id: 'tracker',  label: 'My Tickets',    icon: List },
+  { id: 'raise',    label: 'New Complaint', icon: PlusCircle },
   { id: 'profile',  label: 'Profile',       icon: User },
 ];
 
@@ -25,7 +26,7 @@ function PersonaSwitcher({ user }) {
         onClick={() => setOpen(!open)}
         className="flex items-center gap-2 px-3 py-1.5 bg-white/10 hover:bg-white/20 text-white text-xs rounded-lg transition"
       >
-        <span className="font-medium">{user?.full_name || 'Account'}</span>
+        <span className="font-medium">{user?.name || user?.email || 'Account'}</span>
         <ChevronDown className="w-3 h-3" />
       </button>
       {open && (
@@ -69,7 +70,7 @@ export default function CustomerApp() {
           <div className="flex items-center gap-2.5">
             <div className="w-8 h-8 bg-teal-500 rounded-lg flex items-center justify-center font-black text-slate-950 text-sm">FL</div>
             <span className="font-bold tracking-tight text-sm">FixLoop</span>
-            <span className="text-[10px] bg-teal-500/20 text-teal-300 font-semibold px-1.5 py-0.5 rounded border border-teal-500/30">Customer</span>
+            <span className="text-[10px] bg-teal-500/20 text-teal-300 font-semibold px-1.5 py-0.5 rounded border border-teal-500/30">Customer Portal</span>
           </div>
 
           {/* Desktop Nav */}
@@ -89,6 +90,7 @@ export default function CustomerApp() {
           </nav>
 
           <div className="flex items-center gap-2">
+            <NotificationBell onSelectTicket={goToTracker} />
             <PersonaSwitcher user={user} />
             <button onClick={logout} title="Logout" className="p-1.5 text-slate-400 hover:text-rose-400 transition rounded-lg">
               <LogOut className="w-4 h-4" />

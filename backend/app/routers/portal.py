@@ -3,15 +3,25 @@ from sqlalchemy.orm import Session
 from typing import List, Optional, Dict, Any
 from datetime import datetime, timezone, timedelta
 from app.database import get_db
-from app.models import User, Customer, Product, Ticket, Technician, Appointment, Estimate, Invoice, TicketTimelineEvent, CustomerChatMessage, RepairRecord
-from app.schemas import TicketCreate, EstimateReview, AppointmentReschedule, TicketRatingCreate, ChatMessageCreate, InvoicePay
-from app.services.auth_service import get_current_user, require_roles
+from app.models import (
+    User, Customer, Product, Ticket, Technician, Appointment,
+    Estimate, Invoice, TicketTimelineEvent, CustomerChatMessage,
+    RepairRecord, ResolutionOTP, Notification
+)
+from app.schemas import (
+    TicketCreate, EstimateReview, AppointmentReschedule,
+    TicketRatingCreate, ChatMessageCreate, InvoicePay
+)
+from app.services.auth_service import get_current_user
 from app.services.hindsight_service import hindsight_service
 from app.services.groq_service import groq_service
+from app.services.classifier_service import classify_issue, validate_complaint_input
+from app.services.repeat_detector import check_is_repeat_ticket
+from app.services.ticket_state_machine import transition_ticket_status
+from app.services.notification_service import notification_service
 
 router = APIRouter(prefix="/api/portal", tags=["portal"])
 
-# Customer tracking stage definitions in chronological order
 TRACKING_STAGES = [
     {"key": "complaint_registered", "label": "Complaint Registered", "icon": "file-text"},
     {"key": "support_review", "label": "Support Review", "icon": "clipboard-check"},
@@ -30,14 +40,14 @@ def ensure_customer(user: User, db: Session) -> Customer:
         cust = db.query(Customer).filter(Customer.id == user.customer_id).first()
         if cust:
             return cust
-    
-    # If not linked, check by email/phone
-    cust = db.query(Customer).filter((Customer.email == user.email) | (Customer.phone == user.phone)).first()
+
+    clean_email = user.email.lower().strip()
+    cust = db.query(Customer).filter((Customer.email == clean_email) | (Customer.phone == user.phone)).first()
     if not cust:
         cust = Customer(
             name=user.name,
             phone=user.phone or f"+1-555-CUST-{user.id}",
-            email=user.email,
+            email=clean_email,
             address=user.address
         )
         db.add(cust)
@@ -53,7 +63,7 @@ def get_my_tickets(
 ):
     customer = ensure_customer(current_user, db)
     tickets = db.query(Ticket).filter(Ticket.customer_id == customer.id).order_by(Ticket.created_at.desc()).all()
-    
+
     active_repairs = []
     past_services = []
 
@@ -73,9 +83,7 @@ def get_my_tickets(
             "status": t.status,
             "stage": t.stage or "complaint_registered",
             "priority": t.priority,
-            "image_url": t.image_url,
-            "is_reopened": t.is_reopened,
-            "rating": t.rating,
+            "is_repeat": bool(t.is_repeat),
             "created_at": t.created_at,
             "updated_at": t.updated_at,
             "technician": {
@@ -105,7 +113,7 @@ def get_my_tickets(
             } if invoice else None
         }
 
-        if t.status in ["Resolved", "Closed"]:
+        if t.status in ["RESOLVED", "CANCELLED", "Resolved", "Closed"]:
             past_services.append(item)
         else:
             active_repairs.append(item)
@@ -135,7 +143,6 @@ def get_ticket_tracking_detail(
     if not ticket:
         raise HTTPException(status_code=404, detail="Service ticket not found or access denied")
 
-    # Tracking timeline events
     events = (
         db.query(TicketTimelineEvent)
         .filter(TicketTimelineEvent.ticket_id == ticket.id)
@@ -143,7 +150,6 @@ def get_ticket_tracking_detail(
         .all()
     )
 
-    # Estimate, Invoice, Appointment, Repairs
     estimate = db.query(Estimate).filter(Estimate.ticket_id == ticket.id).order_by(Estimate.created_at.desc()).first()
     invoice = db.query(Invoice).filter(Invoice.ticket_id == ticket.id).order_by(Invoice.created_at.desc()).first()
     appointment = db.query(Appointment).filter(Appointment.ticket_id == ticket.id).order_by(Appointment.scheduled_at.desc()).first()
@@ -152,9 +158,34 @@ def get_ticket_tracking_detail(
         for r in ticket.repairs
     ]
 
-    # Calculate active stage index for Swiggy/Zomato style progress bar
     stage_keys = [s["key"] for s in TRACKING_STAGES]
     current_stage_idx = stage_keys.index(ticket.stage) if ticket.stage in stage_keys else 0
+
+    # Reveal OTP only to the customer when in PENDING_VERIFICATION
+    customer_otp = None
+    if ticket.status == "PENDING_VERIFICATION":
+        # Customer notification containing the OTP
+        notif = (
+            db.query(ResolutionOTP)
+            .filter(ResolutionOTP.ticket_id == ticket.id, ResolutionOTP.used == False)
+            .order_by(ResolutionOTP.created_at.desc())
+            .first()
+        )
+        if notif:
+            # Look up recent OTP notification sent to customer
+            customer_notif = (
+                db.query(Notification)
+                .filter(
+                    Notification.user_id == current_user.id,
+                    Notification.ticket_id == ticket.id,
+                    Notification.type == "OTP_ISSUED"
+                )
+                .order_by(Notification.created_at.desc())
+                .first()
+            )
+            if customer_notif and "code: " in customer_notif.body:
+                code_part = customer_notif.body.split("code: ")[1].split(" ")[0]
+                customer_otp = code_part
 
     return {
         "id": ticket.id,
@@ -173,11 +204,13 @@ def get_ticket_tracking_detail(
         "all_stages": TRACKING_STAGES,
         "priority": ticket.priority,
         "image_url": ticket.image_url,
-        "is_reopened": ticket.is_reopened,
+        "is_repeat": bool(ticket.is_repeat),
+        "is_reopened": bool(ticket.is_reopened),
         "rating": ticket.rating,
         "feedback": ticket.feedback,
         "created_at": ticket.created_at,
         "updated_at": ticket.updated_at,
+        "customer_otp": customer_otp,
         "technician": {
             "id": ticket.technician.id,
             "name": ticket.technician.name,
@@ -230,81 +263,89 @@ async def create_customer_ticket(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
+    try:
+        validate_complaint_input(payload.issue_description)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
     customer = ensure_customer(current_user, db)
 
-    # 1. Product lookup or create
+    # Product
     model = payload.model or "Model X"
-    p_type = payload.product_type or "Washing Machine"
-    brand = payload.brand or "Apex Appliances"
-
     product = (
         db.query(Product)
-        .filter(Product.customer_id == customer.id, Product.model == model)
+        .filter(
+            Product.customer_id == customer.id,
+            Product.model == model
+        )
         .first()
     )
     if not product:
         product = Product(
             customer_id=customer.id,
-            product_type=p_type,
-            brand=brand,
+            product_type=payload.product_type or "Washing Machine",
+            brand=payload.brand or "Apex Appliances",
             model=model,
-            serial_number=payload.serial_number or f"SN-{model[:2]}-{customer.id:04d}"
+            serial_number=f"APX-{model[:1]}-{customer.id:04d}"
         )
         db.add(product)
         db.flush()
 
-    # 2. Check for repeat complaint
-    from app.routers.tickets import normalize_category
-    category = payload.issue_category or normalize_category(payload.issue_description)
+    category = payload.issue_category
+    if not category or category == "General operational issue":
+        category = await classify_issue(payload.issue_description, product.product_type, model)
 
-    prior_tickets_count = (
-        db.query(Ticket)
-        .filter(Ticket.customer_id == customer.id, Ticket.product_id == product.id)
-        .count()
+    is_repeat, prior_ticket, repeat_reason = check_is_repeat_ticket(
+        db=db,
+        customer_id=customer.id,
+        product_id=product.id,
+        issue_category=category,
+        issue_description=payload.issue_description
     )
-    is_repeat = prior_tickets_count > 0
-    initial_status = "Reopened" if is_repeat else "New"
-    initial_stage = "support_review" if is_repeat else "complaint_registered"
-
-    now = datetime.now(timezone.utc)
-    sla_hours = 24 if payload.priority == "High" else 48
-    sla = now + timedelta(hours=sla_hours)
 
     ticket = Ticket(
         customer_id=customer.id,
         product_id=product.id,
         issue_description=payload.issue_description,
         issue_category=category,
-        status=initial_status,
-        stage=initial_stage,
-        priority=payload.priority or "Medium",
-        image_url=payload.image_url,
-        is_reopened=is_repeat,
-        sla_deadline=sla
+        status="OPEN",
+        stage="complaint_registered",
+        priority=payload.priority or ("High" if is_repeat else "Medium"),
+        is_repeat=is_repeat,
+        is_reopened=is_repeat
     )
     db.add(ticket)
     db.flush()
+
     ticket.ticket_code = f"TCK-{1000 + ticket.id}"
 
-    # Log initial timeline event
     ev1 = TicketTimelineEvent(
         ticket_id=ticket.id,
         stage="complaint_registered",
         title="Complaint Registered by Customer",
-        description=f"Issue logged: '{payload.issue_description}'. Priority: {ticket.priority}.",
+        description=f"Issue logged: '{payload.issue_description}'. Priority: {ticket.priority}." + (f" [Flagged Repeat Issue: {repeat_reason}]" if is_repeat else ""),
         performed_by=customer.name
     )
     db.add(ev1)
     db.commit()
     db.refresh(ticket)
 
-    # Retain complaint experience in Hindsight
-    await hindsight_service.retain(
+    # Notifications
+    notification_service.send_notification(
         db=db,
-        entity_type="ticket",
-        entity_id=ticket.id,
-        content=f"Customer {customer.name} (ID: {customer.id}) reported {category} on {model}: '{payload.issue_description}'. Ticket: {ticket.ticket_code}.",
-        metadata={"ticket_code": ticket.ticket_code, "model": model, "is_repeat": is_repeat}
+        user_id=current_user.id,
+        ticket_id=ticket.id,
+        type="TICKET_CREATED",
+        title="Complaint Registered",
+        body=f"Your ticket {ticket.ticket_code} for {model} is registered and pending review."
+    )
+    notification_service.notify_user_by_role(
+        db=db,
+        role="TECHNICIAN",
+        type="TICKET_CREATED",
+        title=f"New Ticket: {ticket.ticket_code}",
+        body=f"New complaint logged for {model} ({category})." + (" [REPEAT ISSUE]" if is_repeat else ""),
+        ticket_id=ticket.id
     )
 
     return {
@@ -313,7 +354,7 @@ async def create_customer_ticket(
         "status": ticket.status,
         "stage": ticket.stage,
         "is_repeat": is_repeat,
-        "message": "Complaint successfully registered. Assigned to Support Review."
+        "message": "Complaint successfully registered."
     }
 
 @router.post("/tickets/{ticket_id}/estimate")
@@ -330,19 +371,17 @@ def review_estimate(
 
     estimate = db.query(Estimate).filter(Estimate.ticket_id == ticket.id).order_by(Estimate.created_at.desc()).first()
     if not estimate:
-        raise HTTPException(status_code=400, detail="No estimate generated for this ticket yet")
+        raise HTTPException(status_code=404, detail="No estimate found for this ticket")
 
-    estimate.status = payload.status
-    if payload.status == "approved":
+    if payload.approved:
+        estimate.status = "approved"
         ticket.stage = "repair_in_progress"
-        ticket.status = "In Progress"
-        
-        # Create invoice
-        inv_num = f"INV-{ticket.id}-{int(datetime.now().timestamp()) % 10000}"
+
+        # Auto generate invoice
         invoice = Invoice(
             ticket_id=ticket.id,
             estimate_id=estimate.id,
-            invoice_number=inv_num,
+            invoice_number=f"INV-{ticket.id}-{int(datetime.now().timestamp()) % 10000:04d}",
             amount=estimate.total,
             status="unpaid"
         )
@@ -352,23 +391,26 @@ def review_estimate(
             ticket_id=ticket.id,
             stage="estimate_approval",
             title="Estimate Approved by Customer",
-            description=f"Customer approved repair cost of ${estimate.total:.2f}. Proceeding with repair.",
+            description=f"Quote of ${estimate.total:.2f} approved. Work authorized.",
             performed_by=customer.name
         )
         db.add(ev)
     else:
-        estimate.rejection_reason = payload.rejection_reason
+        estimate.status = "rejected"
+        estimate.rejection_reason = payload.rejection_reason or "Customer rejected estimate"
+        ticket.stage = "support_review"
+
         ev = TicketTimelineEvent(
             ticket_id=ticket.id,
             stage="estimate_approval",
             title="Estimate Rejected by Customer",
-            description=f"Reason: {payload.rejection_reason or 'Customer declined repair costs'}.",
+            description=f"Reason: {estimate.rejection_reason}. Escalated to support.",
             performed_by=customer.name
         )
         db.add(ev)
 
     db.commit()
-    return {"status": estimate.status, "message": f"Estimate successfully {payload.status}."}
+    return {"status": estimate.status, "stage": ticket.stage}
 
 @router.post("/tickets/{ticket_id}/appointment/reschedule")
 def reschedule_appointment(
@@ -382,29 +424,40 @@ def reschedule_appointment(
     if not ticket:
         raise HTTPException(status_code=404, detail="Ticket not found")
 
-    appointment = db.query(Appointment).filter(Appointment.ticket_id == ticket.id).order_by(Appointment.scheduled_at.desc()).first()
-    if not appointment:
-        raise HTTPException(status_code=400, detail="No active appointment found to reschedule")
+    scheduled_utc = payload.scheduled_at
+    if scheduled_utc.tzinfo is None:
+        scheduled_utc = scheduled_utc.replace(tzinfo=timezone.utc)
 
-    appointment.scheduled_at = payload.scheduled_at
-    appointment.status = "rescheduled"
-    appointment.notes = f"Rescheduled by customer. Reason: {payload.reason or 'Customer request'}."
+    # State Machine Transition to RESCHEDULED
+    transition_ticket_status(
+        db=db,
+        ticket=ticket,
+        target_status="RESCHEDULED",
+        actor=current_user,
+        note=f"Customer requested reschedule: {payload.reason or 'Timing conflict'}"
+    )
+
+    appointment = db.query(Appointment).filter(Appointment.ticket_id == ticket.id).order_by(Appointment.scheduled_at.desc()).first()
+    if appointment:
+        appointment.status = "rescheduled"
+        appointment.scheduled_at = scheduled_utc
+        appointment.reschedule_reason = payload.reason
 
     ev = TicketTimelineEvent(
         ticket_id=ticket.id,
         stage="visit_scheduled",
-        title="Technician Appointment Rescheduled",
-        description=f"New appointment set for {payload.scheduled_at.strftime('%b %d, %Y at %I:%M %p')}.",
+        title="Visit Rescheduled by Customer",
+        description=f"Requested new slot: {scheduled_utc.strftime('%b %d, %Y at %I:%M %p')}. Reason: {payload.reason or 'Timing conflict'}.",
         performed_by=customer.name
     )
     db.add(ev)
     db.commit()
-    return {"status": "rescheduled", "new_time": appointment.scheduled_at}
+    return {"status": "rescheduled", "new_date": scheduled_utc}
 
 @router.post("/tickets/{ticket_id}/pay")
 def pay_invoice(
     ticket_id: int,
-    payload: InvoicePay,
+    payload: InvoicePay = InvoicePay(),
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
@@ -413,9 +466,9 @@ def pay_invoice(
     if not ticket:
         raise HTTPException(status_code=404, detail="Ticket not found")
 
-    invoice = db.query(Invoice).filter(Invoice.ticket_id == ticket.id).order_by(Invoice.created_at.desc()).first()
+    invoice = db.query(Invoice).filter(Invoice.ticket_id == ticket.id, Invoice.status == "unpaid").first()
     if not invoice:
-        raise HTTPException(status_code=404, detail="Invoice not found")
+        raise HTTPException(status_code=400, detail="No unpaid invoice found for this ticket")
 
     invoice.status = "paid"
     invoice.paid_at = datetime.now(timezone.utc)
@@ -424,13 +477,13 @@ def pay_invoice(
     ev = TicketTimelineEvent(
         ticket_id=ticket.id,
         stage="resolved",
-        title="Payment Received",
-        description=f"Payment of ${invoice.amount:.2f} processed via {payload.payment_method}.",
-        performed_by="Customer"
+        title="Invoice Paid Successfully",
+        description=f"Payment of ${invoice.amount:.2f} completed via {payload.payment_method}.",
+        performed_by=customer.name
     )
     db.add(ev)
     db.commit()
-    return {"status": "paid", "invoice_number": invoice.invoice_number, "amount": invoice.amount}
+    return {"status": "paid", "amount": invoice.amount}
 
 @router.post("/tickets/{ticket_id}/rate")
 def rate_service(
@@ -447,64 +500,16 @@ def rate_service(
     ticket.rating = payload.rating
     ticket.feedback = payload.feedback
 
-    # Update technician average rating if assigned
-    if ticket.technician:
-        all_tech_ratings = (
-            db.query(Ticket.rating)
-            .filter(Ticket.technician_id == ticket.technician.id, Ticket.rating.isnot(None))
-            .all()
-        )
-        if all_tech_ratings:
-            scores = [r[0] for r in all_tech_ratings]
-            ticket.technician.rating = round(sum(scores) / len(scores), 1)
-
     ev = TicketTimelineEvent(
         ticket_id=ticket.id,
         stage="resolved",
-        title="Customer Rating & Feedback Submitted",
-        description=f"Rated {payload.rating}/5 stars. Feedback: '{payload.feedback or 'No comment'}'.",
+        title=f"Customer Rated Service: {payload.rating} Stars",
+        description=payload.feedback or "Customer submitted service rating.",
         performed_by=customer.name
     )
     db.add(ev)
     db.commit()
-    return {"rating": ticket.rating, "feedback": ticket.feedback}
-
-@router.post("/tickets/{ticket_id}/reopen")
-async def reopen_ticket(
-    ticket_id: int,
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db)
-):
-    customer = ensure_customer(current_user, db)
-    ticket = db.query(Ticket).filter(Ticket.id == ticket_id, Ticket.customer_id == customer.id).first()
-    if not ticket:
-        raise HTTPException(status_code=404, detail="Ticket not found")
-
-    ticket.status = "Reopened"
-    ticket.stage = "support_review"
-    ticket.is_reopened = True
-    ticket.updated_at = datetime.now(timezone.utc)
-
-    ev = TicketTimelineEvent(
-        ticket_id=ticket.id,
-        stage="support_review",
-        title="Ticket Reopened by Customer",
-        description="Customer indicated that the same problem recurred. Priority escalated to High.",
-        performed_by=customer.name
-    )
-    db.add(ev)
-    db.commit()
-
-    # Retain the recurrence event in Hindsight
-    await hindsight_service.retain(
-        db=db,
-        entity_type="ticket_recurrence",
-        entity_id=ticket.id,
-        content=f"REPEAT COMPLAINT REOPENED: Customer {customer.name} reopened ticket {ticket.ticket_code} for {ticket.product.model}. Previous fix did not hold permanently.",
-        metadata={"ticket_code": ticket.ticket_code, "model": ticket.product.model, "reopened": True}
-    )
-
-    return {"status": ticket.status, "stage": ticket.stage, "message": "Ticket reopened. Support and engineering alerted."}
+    return {"status": "rated", "rating": ticket.rating}
 
 # ----------------- Customer AI Support Chat -----------------
 @router.get("/chat")
@@ -523,7 +528,6 @@ def get_chat_history(
             "id": m.id,
             "sender": m.sender,
             "message": m.message,
-            "ticket_id": m.ticket_id,
             "created_at": m.created_at
         }
         for m in messages
@@ -536,8 +540,8 @@ async def send_chat_message(
     db: Session = Depends(get_db)
 ):
     customer = ensure_customer(current_user, db)
-    
-    # 1. Save customer's message
+
+    # Save customer message
     cust_msg = CustomerChatMessage(
         customer_id=customer.id,
         ticket_id=payload.ticket_id,
@@ -547,66 +551,53 @@ async def send_chat_message(
     db.add(cust_msg)
     db.commit()
 
-    # 2. Gather customer context (DATA ISOLATION: strictly only this customer's tickets)
-    active_tickets = db.query(Ticket).filter(Ticket.customer_id == customer.id).all()
-    ticket_summaries = [
-        f"{t.ticket_code}: {t.product.brand} {t.product.model} ({t.issue_category}) - Status: {t.status}, Stage: {t.stage}"
-        for t in active_tickets
-    ]
-
-    # 3. Recall relevant experience from Hindsight
-    query = f"{customer.name} {payload.message}"
+    # Context query for AI
+    query = f"Customer inquiry: {payload.message}"
     recall_res = await hindsight_service.recall(db=db, query=query, limit=3)
     memories = recall_res.get("memories", [])
-    memory_text = "\n".join([m.get("text", "") for m in memories])
+    memory_context = "\n".join([f"- {m['text']}" for m in memories]) if memories else "No specific past repair recall."
 
-    # 4. Generate AI response using Groq
-    system_prompt = f"""You are the friendly, helpful FixLoop AI Customer Support Assistant.
-You are helping customer {customer.name}.
-Customer's registered appliances and tickets:
-{chr(10).join(ticket_summaries) if ticket_summaries else 'No tickets currently registered.'}
+    # Groq assistant prompt
+    reply_text = (
+        f"Thank you for contacting FixLoop Support, {customer.name}. "
+        "Our service team is monitoring your repair progress. "
+        "Your technician has been dispatched with diagnostics verified against previous model repair histories."
+    )
+    client = groq_service.get_client()
+    if client:
+        try:
+            resp = await client.chat.completions.create(
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            "You are FixLoop's friendly, reassuring Customer Support AI. "
+                            "Help the customer understand their repair status or appliance care. "
+                            f"Ground your answer in these memory notes: {memory_context}. "
+                            "Keep answers concise, polite, and helpful (max 3 sentences)."
+                        )
+                    },
+                    {"role": "user", "content": payload.message}
+                ],
+                model=groq_service.model,
+                temperature=0.3
+            )
+            reply_text = resp.choices[0].message.content
+        except Exception:
+            pass
 
-Relevant knowledge from FixLoop memory:
-{memory_text if memory_text else 'Standard appliance operations.'}
-
-RULES:
-- Be polite, concise, empathetic, and professional.
-- Help the customer understand their repair status, scheduled appointment, or safety steps (e.g. turning off main water inlet, power cord safety).
-- NEVER disclose other customers' names, tickets, or internal engineering secrets.
-- If a technician is assigned, reassure them that our authorized expert is on it.
-"""
-    ai_reply = "Thank you for reaching out! Your service request has been reviewed, and our operations team is actively coordinating your visit. Please let us know if you need to adjust your schedule."
-
-    if groq_service.is_configured():
-        client = groq_service.get_client()
-        if client:
-            try:
-                completion = await client.chat.completions.create(
-                    messages=[
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": payload.message}
-                    ],
-                    model=groq_service.model,
-                    temperature=0.3,
-                    max_tokens=250
-                )
-                ai_reply = completion.choices[0].message.content
-            except Exception as e:
-                pass
-
-    # Save AI message
     ai_msg = CustomerChatMessage(
         customer_id=customer.id,
         ticket_id=payload.ticket_id,
         sender="ai",
-        message=ai_reply
+        message=reply_text
     )
     db.add(ai_msg)
     db.commit()
     db.refresh(ai_msg)
 
     return {
-        "reply": ai_reply,
         "message_id": ai_msg.id,
+        "reply": ai_msg.message,
         "created_at": ai_msg.created_at
     }

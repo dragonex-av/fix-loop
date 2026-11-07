@@ -2,11 +2,12 @@ import React, { useState } from 'react';
 import { useAuth, DEMO_PERSONAS } from './context/AuthContext';
 import LoginPage from './pages/LoginPage';
 import CustomerApp from './pages/customer/CustomerApp';
+import NotificationBell from './components/NotificationBell';
 
 // Operations dashboard imports
 import { 
   LayoutDashboard, PlusCircle, Users, Wrench, TrendingUp, 
-  Clock, Cpu, ShieldCheck, LogOut, ChevronDown
+  Clock, Cpu, ShieldCheck, LogOut, ChevronDown, CheckCircle2
 } from 'lucide-react';
 import Dashboard from './pages/Dashboard';
 import NewComplaint from './pages/NewComplaint';
@@ -16,17 +17,7 @@ import BusinessInsights from './pages/BusinessInsights';
 import FollowUps from './pages/FollowUps';
 import MemoryExplorer from './pages/MemoryExplorer';
 
-const NAV_ITEMS = [
-  { id: 'dashboard',      label: 'Dashboard',         icon: LayoutDashboard },
-  { id: 'new-complaint',  label: 'New Complaint',      icon: PlusCircle },
-  { id: 'customer-360',   label: 'Customer 360',       icon: Users },
-  { id: 'assistant',      label: 'AI Repair Assistant',icon: Wrench },
-  { id: 'ripple-effect',  label: 'Ripple Effect',      icon: TrendingUp },
-  { id: 'followups',      label: 'Follow-Up Center',   icon: Clock },
-  { id: 'memory-explorer',label: 'Memory Explorer',    icon: Cpu, badge: 'Trust' },
-];
-
-function PersonaSwitcher({ user, onSwitch }) {
+function PersonaSwitcher({ user }) {
   const [open, setOpen] = useState(false);
   const { loginWithEmail } = useAuth();
 
@@ -41,7 +32,7 @@ function PersonaSwitcher({ user, onSwitch }) {
         onClick={() => setOpen(!open)}
         className="flex items-center gap-2 px-3 py-1.5 bg-slate-800 border border-slate-700 hover:border-teal-500/50 text-slate-300 text-xs rounded-lg transition"
       >
-        <span className="font-medium">{user?.full_name || user?.email}</span>
+        <span className="font-medium">{user?.name || user?.email}</span>
         <ChevronDown className="w-3 h-3" />
       </button>
       {open && (
@@ -67,7 +58,7 @@ function PersonaSwitcher({ user, onSwitch }) {
 }
 
 function OpsLayout() {
-  const { user, logout } = useAuth();
+  const { user, role, isAdmin, isTechnician, logout } = useAuth();
   const [currentTab, setCurrentTab] = useState('dashboard');
   const [selectedTicketId, setSelectedTicketId] = useState(1);
   const [selectedCustomerId, setSelectedCustomerId] = useState(1);
@@ -81,6 +72,20 @@ function OpsLayout() {
     setSelectedCustomerId(customerId);
     setCurrentTab('customer-360');
   };
+
+  // RBAC Navigation items
+  const navItems = [
+    { id: 'dashboard',      label: 'Dashboard',          icon: LayoutDashboard },
+    { id: 'new-complaint',  label: 'New Complaint',       icon: PlusCircle },
+    { id: 'customer-360',   label: 'Customer 360',        icon: Users },
+    { id: 'assistant',      label: 'AI Repair Assistant', icon: Wrench },
+    // Ripple Effect & Memory Explorer reserved for ADMIN role
+    ...(isAdmin ? [
+      { id: 'ripple-effect',  label: 'Ripple Effect',       icon: TrendingUp },
+      { id: 'memory-explorer',label: 'Memory Explorer',     icon: Cpu, badge: 'Trust' },
+    ] : []),
+    { id: 'followups',      label: 'Follow-Up Center',    icon: Clock },
+  ];
 
   return (
     <div className="flex h-screen bg-slate-100 font-sans text-slate-900 overflow-hidden">
@@ -100,7 +105,7 @@ function OpsLayout() {
         </div>
 
         <nav className="p-3 space-y-1 flex-1 overflow-y-auto">
-          {NAV_ITEMS.map((item) => {
+          {navItems.map((item) => {
             const Icon = item.icon;
             const isActive = currentTab === item.id;
             return (
@@ -151,9 +156,14 @@ function OpsLayout() {
           <div className="flex items-center gap-3">
             <div className="hidden sm:flex items-center gap-2 px-3 py-1 bg-slate-50 border border-slate-200 rounded-lg text-xs text-slate-600">
               <ShieldCheck className="w-3.5 h-3.5 text-teal-600" />
-              <span>Role: <strong className="capitalize">{user?.role}</strong></span>
+              <span>Role: <strong className="uppercase">{role}</strong></span>
             </div>
+
+            {/* Notification Bell */}
+            <NotificationBell onSelectTicket={handleTicketSelect} />
+
             <PersonaSwitcher user={user} />
+
             <button
               onClick={() => setCurrentTab('new-complaint')}
               className="px-3.5 py-1.5 bg-teal-600 hover:bg-teal-500 text-white text-xs font-semibold rounded-lg shadow-sm transition flex items-center gap-1.5"
@@ -209,7 +219,7 @@ export default function App() {
           </div>
           <div className="flex items-center justify-center gap-2 text-slate-400 text-sm">
             <span className="w-4 h-4 border-2 border-slate-600 border-t-teal-400 rounded-full animate-spin" />
-            <span>Loading FixLoop...</span>
+            <span>Loading FixLoop v2.0...</span>
           </div>
         </div>
       </div>
