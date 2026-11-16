@@ -4,9 +4,11 @@ __pycache__/
 *$py.class
 backend/venv/
 .env
-backend/.env
+.env.*
+!.env.example
 fixloop.db
 *.sqlite3
+*.db
 
 # Node / Frontend
 node_modules/

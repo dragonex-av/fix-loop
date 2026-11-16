@@ -51,7 +51,8 @@ pip install -r requirements.txt
 
 # Copy environment variables
 cp .env.example .env
-# (Optional) Add your HINDSIGHT_API_KEY and GROQ_API_KEY into backend/.env
+# Set JWT_SECRET to a unique random value of at least 32 characters.
+# Optionally add your HINDSIGHT_API_KEY and GROQ_API_KEY into backend/.env.
 
 # Seed deterministic demo dataset
 python3 -m app.seed_data
@@ -75,6 +76,26 @@ PYTHONPATH=. ./venv/bin/pytest tests/
 ```
 
 ---
+
+## Netlify deployment
+
+`netlify.toml` builds the Vite frontend and publishes only `frontend/dist`.
+Backend source, environment files, and local databases must never be published.
+This configuration deploys the frontend only; it does not host the Python API.
+The frontend currently calls `http://localhost:8000/api`, so a deployed API and
+its frontend connection still need configuring before the hosted app can use it.
+
+Keep credentials in the runtime environment of the service running the backend.
+`JWT_SECRET` is required and must contain at least 32 characters. Generate a
+unique random value privately; do not reuse the former committed signing key.
+Replacing the signing key invalidates existing sessions.
+
+Secret scanning remains enabled. Only the non-sensitive app name, debug flag,
+model name, memory bank identifier, and public Hindsight API URL are excluded
+from value matching. Database credentials and API keys remain scanned. Do not
+add credentials to these excluded settings or expose them through `VITE_` variables.
+If a credential was exposed in an earlier revision or deploy, revoke and replace
+it with the provider; removing it from current files does not revoke it.
 
 ## 4. Reproducible 5-Minute Judge Demo Walkthrough
 
