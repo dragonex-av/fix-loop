@@ -1,0 +1,12 @@
+[build]
+  command = "npm --prefix frontend ci && npm --prefix frontend run build"
+  publish = "frontend/dist"
+
+[build.environment]
+  # Public configuration values match source defaults. Keep credentials scanned.
+  SECRETS_SCAN_OMIT_KEYS = "APP_NAME,DEBUG,GROQ_MODEL,HINDSIGHT_BANK_OR_AGENT_ID,HINDSIGHT_BASE_URL"
+
+[[redirects]]
+  from = "/*"
+  to = "/index.html"
+  status = 200
